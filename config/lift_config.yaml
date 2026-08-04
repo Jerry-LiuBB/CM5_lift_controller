@@ -1,0 +1,17 @@
+lift_controller:
+  ros__parameters:
+    can_interface: "can0"
+    can_bitrate: 1000000
+    node_id: 1
+    mm_to_pulses: 1000
+    max_position_mm: 500
+    min_position_mm: 0
+    default_speed_rpm: 100
+    max_speed_rpm: 200
+    min_speed_rpm: 0
+    accel_time_ms: 500
+    decel_time_ms: 500
+    status_update_hz: 10
+    reconnect_timeout_ms: 1000
+    pdo_enabled: true
+    pdo_frequency_hz: 200

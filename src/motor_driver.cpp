@@ -1,0 +1,818 @@
+#include "lift_controller/motor_driver.hpp"
+#include <iostream>
+#include <cstring>
+#include <chrono>
+
+namespace lift_controller {
+
+// CiA 402 对象字典
+constexpr uint16_t OD_CONTROLWORD     = 0x6040;
+constexpr uint16_t OD_STATUSWORD      = 0x6041;
+constexpr uint16_t OD_TARGET_VELOCITY  = 0x60FF;
+constexpr uint16_t OD_MODES_OP        = 0x6060;
+constexpr uint16_t OD_PROFILE_ACC     = 0x6083;
+constexpr uint16_t OD_PROFILE_DEC      = 0x6084;
+constexpr uint16_t OD_ERROR_CODE      = 0x603F;
+constexpr uint16_t OD_TARGET_POSITION = 0x607A;
+constexpr uint16_t OD_PROFILE_VELOCITY = 0x6081;
+constexpr uint16_t OD_POSITION_ACTUAL = 0x6063;
+constexpr uint16_t OD_VELOCITY_ACTUAL = 0x606C;
+constexpr uint16_t OD_HOME_OFFSET     = 0x607C;
+constexpr uint16_t OD_HOMING_METHOD   = 0x6098;
+
+// PDO 通信/映射参数
+constexpr uint16_t OD_RPDO1_COMM     = 0x1400;
+constexpr uint16_t OD_RPDO1_MAP      = 0x1600;
+constexpr uint16_t OD_TPDO1_COMM     = 0x1800;
+constexpr uint16_t OD_TPDO1_MAP      = 0x1A00;
+
+// 驱动器厂商参数
+constexpr uint16_t OD_CONTROL_MODE    = 0x2102;  // F0.1.002: 20=CANopen模式
+
+MotorDriver::MotorDriver(CanInterface& can_iface)
+    : can_iface_(can_iface), initialized_(false), running_(false), connected_(false),
+      pdo_mode_(false), control_running_(false), reconnect_running_(false) {
+    std::memset(&status_, 0, sizeof(status_));
+    pdo_control_word_ = 0;
+    pdo_target_position_ = 0;
+    pdo_trigger_pending_ = false;
+}
+
+MotorDriver::~MotorDriver() { shutdown(); }
+
+void MotorDriver::setConfig(const MotorConfig& config) {
+    config_ = config;
+}
+
+bool MotorDriver::init(const MotorConfig& config) {
+    if (initialized_) return true;
+    config_ = config;
+    connected_ = can_iface_.is_connected();
+
+    if (!connected_) {
+        std::cerr << "[Motor] CAN not connected" << std::endl;
+        return false;
+    }
+
+    // 检查驱动器是否处于 CANopen 模式 (F0.1.002 = 20)
+    uint32_t mode_val;
+    if (readSDO(OD_CONTROL_MODE, 0, mode_val)) {
+        if (mode_val != 20) {
+            std::cerr << "[Motor] WARNING: Drive not in CANopen mode (F0.1.002=" << mode_val
+                      << ", need 20). Set F0.1.002=20 and power cycle." << std::endl;
+        }
+    } else {
+        std::cerr << "[Motor] Cannot read F0.1.002 — drive may not be in CANopen mode."
+                  << "\n  Check: 1) CAN wiring  2) Drive power  3) F0.1.002=20  4) Node ID="
+                  << config_.node_id << std::endl;
+    }
+
+    // SDO 配置驱动参数 (PP 模式)
+    if (!reconfigureDrive()) {
+        std::cerr << "[Motor] Failed to configure drive" << std::endl;
+        return false;
+    }
+
+    // 尝试 PDO 模式
+    if (config_.pdo_enabled) {
+        if (configurePDO()) {
+            pdo_mode_ = true;
+            std::cout << "[Motor] PDO mode configured (PP, "
+                      << config_.pdo_frequency_hz << " Hz)" << std::endl;
+        } else {
+            std::cerr << "[Motor] PDO config failed, falling back to SDO mode" << std::endl;
+            pdo_mode_ = false;
+        }
+    } else {
+        pdo_mode_ = false;
+    }
+
+    initialized_ = true;
+    running_ = true;
+
+    // 注册 TPDO 接收回调
+    can_iface_.setReceiveCallback(
+        [this](const CanFrame& frame) { this->handleTPDO(frame); });
+
+    if (pdo_mode_) {
+        // 读取当前位置作为初始目标
+        uint32_t pos;
+        if (readSDO(OD_POSITION_ACTUAL, 0, pos)) {
+            pdo_target_position_ = static_cast<int32_t>(pos);
+        }
+        pdo_control_word_ = 0x0F;
+        pdo_trigger_pending_ = false;
+
+        // 通过 SDO 使能驱动
+        enable();
+
+        {
+            std::lock_guard<std::mutex> lock(tpdo_time_mutex_);
+            last_tpdo_time_ = std::chrono::steady_clock::now();
+        }
+        startPDOMode();
+
+        // PDO 模式下 statusUpdateLoop 不运行,启动独立重连看门狗检测断电
+        reconnect_running_ = true;
+        reconnect_thread_ = std::thread(&MotorDriver::reconnectLoop, this);
+    } else {
+        status_thread_ = std::thread(&MotorDriver::statusUpdateLoop, this);
+    }
+
+    std::cout << "[Motor] Initialized, Node: " << config_.node_id
+              << (pdo_mode_ ? " (PDO)" : " (SDO)") << std::endl;
+    return true;
+}
+
+bool MotorDriver::reconfigureDrive() {
+    // PP 模式 (mode=1) — 驱动器内部处理轨迹
+    if (!writeSDO(OD_MODES_OP, 0, 1, 1)) {
+        std::cerr << "[Motor] Failed to set PP mode (1)" << std::endl;
+        return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    if (!writeSDO(OD_PROFILE_ACC, 0, static_cast<uint32_t>(config_.accel_time_ms), 4)) {
+        std::cerr << "[Motor] Failed to set acceleration" << std::endl;
+        return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    if (!writeSDO(OD_PROFILE_DEC, 0, static_cast<uint32_t>(config_.decel_time_ms), 4)) {
+        std::cerr << "[Motor] Failed to set deceleration" << std::endl;
+        return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    if (config_.default_speed_rpm > 0) {
+        writeSDO(OD_PROFILE_VELOCITY, 0,
+                 static_cast<uint32_t>(config_.default_speed_rpm * 10), 4);
+    }
+    return true;
+}
+
+bool MotorDriver::configurePDO() {
+    // 进入 Pre-Operational 配置 PDO
+    if (!sendNMT(0x80)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // === RPDO1: ControlWord(16) + TargetPosition(32) ===
+    if (!writeSDO(OD_RPDO1_COMM, 2, 1, 1)) return false;  // 传输类型=同步
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    if (!writeSDO(OD_RPDO1_MAP, 0, 0, 1)) return false;  // 禁用映射
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!writeSDO(OD_RPDO1_MAP, 1, 0x60400010, 4)) return false;  // ControlWord 16bit
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!writeSDO(OD_RPDO1_MAP, 2, 0x607A0020, 4)) return false;  // TargetPosition 32bit
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!writeSDO(OD_RPDO1_MAP, 0, 2, 1)) return false;  // 启用(2个对象)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    // === TPDO1: StatusWord(16) + PositionActual(32) + ErrorCode(16) ===
+    if (!writeSDO(OD_TPDO1_COMM, 2, 1, 1)) return false;  // 传输类型=同步
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    if (!writeSDO(OD_TPDO1_MAP, 0, 0, 1)) return false;  // 禁用映射
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!writeSDO(OD_TPDO1_MAP, 1, 0x60410010, 4)) return false;  // StatusWord 16bit
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!writeSDO(OD_TPDO1_MAP, 2, 0x60630020, 4)) return false;  // PositionActual 32bit
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!writeSDO(OD_TPDO1_MAP, 3, 0x603F0010, 4)) return false;  // ErrorCode 16bit
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!writeSDO(OD_TPDO1_MAP, 0, 3, 1)) return false;  // 启用(3个对象)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    // 进入 Operational
+    if (!sendNMT(0x01)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    return true;
+}
+
+void MotorDriver::shutdown() {
+    running_ = false;
+    reconnect_running_ = false;
+    if (reconnect_thread_.joinable()) reconnect_thread_.join();
+    stopPDOMode();
+    if (status_thread_.joinable()) status_thread_.join();
+    if (connected_) disable();
+    can_iface_.setReceiveCallback(nullptr);
+    initialized_ = false;
+}
+
+bool MotorDriver::writeSDO(uint16_t index, uint8_t subindex, uint32_t data, uint8_t length) {
+    if (!connected_) return false;
+
+    CanFrame frame;
+    frame.id = 0x600 + config_.node_id;
+    frame.dlc = 8;
+
+    uint8_t cmd;
+    switch (length) {
+        case 1: cmd = 0x2F; break;
+        case 2: cmd = 0x2B; break;
+        case 4: cmd = 0x23; break;
+        default: return false;
+    }
+
+    frame.data[0] = cmd;
+    frame.data[1] = index & 0xFF;
+    frame.data[2] = (index >> 8) & 0xFF;
+    frame.data[3] = subindex;
+    std::memcpy(&frame.data[4], &data, length);
+    std::memset(&frame.data[4 + length], 0, 4 - length);
+
+    CanFrame rx_frame;
+    if (!can_iface_.sendAndWait(frame, rx_frame, 0x580 + config_.node_id, 200)) {
+        return false;
+    }
+    if ((rx_frame.data[0] & 0xFF) == 0x80) {
+        uint32_t abort_code = 0;
+        std::memcpy(&abort_code, &rx_frame.data[4], 4);
+        std::cerr << "[Motor] SDO write aborted: index=0x" << std::hex << index
+                  << " code=0x" << abort_code << std::dec << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool MotorDriver::readSDO(uint16_t index, uint8_t subindex, uint32_t& data) {
+    if (!connected_) return false;
+
+    CanFrame frame;
+    frame.id = 0x600 + config_.node_id;
+    frame.dlc = 8;
+    frame.data[0] = 0x40;
+    frame.data[1] = index & 0xFF;
+    frame.data[2] = (index >> 8) & 0xFF;
+    frame.data[3] = subindex;
+    std::memset(&frame.data[4], 0, 4);
+
+    CanFrame rx_frame;
+    if (!can_iface_.sendAndWait(frame, rx_frame, 0x580 + config_.node_id, 200)) {
+        return false;
+    }
+
+    uint8_t cmd = rx_frame.data[0];
+    if (cmd == 0x80) {
+        uint32_t abort_code = 0;
+        std::memcpy(&abort_code, &rx_frame.data[4], 4);
+        std::cerr << "[Motor] SDO read aborted: index=0x" << std::hex << index
+                  << " code=0x" << abort_code << std::dec << std::endl;
+        return false;
+    }
+
+    if (cmd & 0x02) {
+        uint8_t n = (cmd >> 2) & 0x03;
+        size_t valid_bytes = 4 - n;
+        data = 0;
+        std::memcpy(&data, &rx_frame.data[4], valid_bytes);
+        return true;
+    }
+    return false;
+}
+
+bool MotorDriver::readSDO16(uint16_t index, uint8_t subindex, uint16_t& data) {
+    uint32_t temp;
+    if (!readSDO(index, subindex, temp)) return false;
+    data = static_cast<uint16_t>(temp);
+    return true;
+}
+
+bool MotorDriver::sendControlWord(uint16_t value) {
+    return writeSDO(OD_CONTROLWORD, 0, value, 2);
+}
+
+bool MotorDriver::sendNMT(uint8_t command) {
+    CanFrame frame;
+    frame.id = 0x000;
+    frame.dlc = 2;
+    frame.data[0] = command;
+    frame.data[1] = static_cast<uint8_t>(config_.node_id);
+    return can_iface_.send(frame);
+}
+
+void MotorDriver::startPDOMode() {
+    if (control_running_) return;
+    control_running_ = true;
+    control_thread_ = std::thread(&MotorDriver::controlLoop, this);
+}
+
+void MotorDriver::stopPDOMode() {
+    control_running_ = false;
+    if (control_thread_.joinable()) control_thread_.join();
+}
+
+void MotorDriver::controlLoop() {
+    // 200Hz 控制循环:每周期发 RPDO(ControlWord + TargetPosition) + SYNC
+    auto period = std::chrono::microseconds(1000000 / config_.pdo_frequency_hz);
+    auto next_deadline = std::chrono::steady_clock::now() + period;
+
+    while (control_running_) {
+        // PP 模式:bit4 上升沿触发新位置命令
+        uint16_t cw = pdo_control_word_.load(std::memory_order_relaxed);
+        if (pdo_trigger_pending_.exchange(false)) {
+            cw |= 0x10;  // set bit4 (new setpoint)
+        }
+
+        // 构建 RPDO: ControlWord(2) + TargetPosition(4) = 6 bytes
+        CanFrame rpdo;
+        rpdo.id = 0x200 + config_.node_id;
+        rpdo.dlc = 6;
+        int32_t tp = pdo_target_position_.load(std::memory_order_relaxed);
+        std::memcpy(&rpdo.data[0], &cw, 2);
+        std::memcpy(&rpdo.data[2], &tp, 4);
+        can_iface_.send(rpdo);
+
+        // SYNC (COB-ID=0x80)
+        CanFrame sync;
+        sync.id = 0x80;
+        sync.dlc = 0;
+        can_iface_.send(sync);
+
+        // TPDO 超时检测
+        {
+            std::lock_guard<std::mutex> lock(tpdo_time_mutex_);
+            auto since_tpdo = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - last_tpdo_time_).count();
+            if (since_tpdo > 500) connected_ = false;
+        }
+
+        std::this_thread::sleep_until(next_deadline);
+        next_deadline += period;
+    }
+}
+
+void MotorDriver::handleTPDO(const CanFrame& frame) {
+    if (frame.id != static_cast<uint32_t>(0x180 + config_.node_id)) return;
+    if (frame.dlc < 8) return;
+
+    uint16_t status_word;
+    int32_t position_actual;
+    uint16_t error_code;
+    std::memcpy(&status_word, &frame.data[0], 2);
+    std::memcpy(&position_actual, &frame.data[2], 4);
+    std::memcpy(&error_code, &frame.data[6], 2);
+
+    MotorStatus new_status;
+    {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        new_status = status_;
+    }
+    new_status.status_word = status_word;
+    new_status.position_pulses = position_actual;
+    new_status.error_code = error_code;
+    new_status.is_enabled = (status_word & 0x04) != 0;
+    new_status.target_reached = (status_word & 0x0400) != 0;
+    new_status.is_fault = (status_word & 0x08) != 0;
+
+    {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        status_ = new_status;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(tpdo_time_mutex_);
+        last_tpdo_time_ = std::chrono::steady_clock::now();
+    }
+
+    if (status_callback_) status_callback_(new_status);
+}
+
+void MotorDriver::reconnectLoop() {
+    // PDO 模式断电重连看门狗:定期检测 connected_ 状态,
+    // controlLoop 检测到 TPDO 超时会置 connected_=false,此处触发重连
+    bool was_connected = true;
+    while (reconnect_running_) {
+        if (!connected_) {
+            if (was_connected) {
+                std::cerr << "[Motor] PDO: connection lost, attempting reconnect..." << std::endl;
+                was_connected = false;
+            }
+            checkConnection();
+        } else {
+            was_connected = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+}
+
+bool MotorDriver::enable() {
+    if (!connected_ && !pdo_mode_) return false;
+
+    if (pdo_mode_ && control_running_) {
+        pdo_control_word_ = 0x06;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        pdo_control_word_ = 0x07;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        pdo_control_word_ = 0x0F;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        return true;
+    }
+
+    if (!sendControlWord(0x06)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (!sendControlWord(0x07)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (!sendControlWord(0x0F)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    updateStatus();
+    if (status_.is_enabled) {
+        std::cout << "[Motor] Enabled" << std::endl;
+        return true;
+    }
+    std::cerr << "[Motor] Enable check failed" << std::endl;
+    return false;
+}
+
+bool MotorDriver::disable() {
+    if (pdo_mode_ && control_running_) {
+        pdo_control_word_ = 0x07;
+        return true;
+    }
+    if (!connected_) return false;
+    return sendControlWord(0x07);
+}
+
+bool MotorDriver::setPosition(int position_mm, int speed_rpm) {
+    if (position_mm < config_.min_position_mm || position_mm > config_.max_position_mm) {
+        std::cerr << "[Motor] Position out of range: " << position_mm << " mm" << std::endl;
+        return false;
+    }
+
+    // 速度限幅
+    if (speed_rpm > config_.max_speed_rpm) {
+        std::cerr << "[Motor] Speed clamped: " << speed_rpm << " -> " << config_.max_speed_rpm << " rpm" << std::endl;
+        speed_rpm = config_.max_speed_rpm;
+    } else if (speed_rpm < 0) {
+        std::cerr << "[Motor] Speed clamped: " << speed_rpm << " -> 0 rpm" << std::endl;
+        speed_rpm = 0;
+    }
+
+    int32_t target_pulses = position_mm * config_.mm_to_pulses;
+
+    if (pdo_mode_) {
+        if (!connected_) {
+            std::cerr << "[Motor] Not connected, cannot set position" << std::endl;
+            return false;
+        }
+        // 如果控制循环未运行(setSpeed 后),重启 PDO
+        if (!control_running_) {
+            if (!writeSDO(OD_MODES_OP, 0, 1, 1)) {
+                return setPositionSDO(position_mm, speed_rpm);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            sendControlWord(0x0F);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            uint32_t pos;
+            if (readSDO(OD_POSITION_ACTUAL, 0, pos)) {
+                pdo_target_position_ = static_cast<int32_t>(pos);
+            }
+            pdo_control_word_ = 0x0F;
+            startPDOMode();
+        }
+
+        // 设置速度(profile velocity, PP 模式用)
+        if (speed_rpm > 0) {
+            writeSDO(OD_PROFILE_VELOCITY, 0,
+                     static_cast<uint32_t>(speed_rpm * 10), 4);
+        }
+
+        // 更新目标位置并触发 bit4
+        pdo_target_position_ = target_pulses;
+        pdo_trigger_pending_ = true;  // 下一个控制周期发 0x1F
+
+        std::cout << "[Motor] PDO target: " << position_mm << " mm ("
+                  << target_pulses << " pulses)" << std::endl;
+        return true;
+    }
+
+    return setPositionSDO(position_mm, speed_rpm);
+}
+
+bool MotorDriver::setPositionSDO(int position_mm, int speed_rpm) {
+    if (!connected_) return false;
+
+    int32_t pulses = position_mm * config_.mm_to_pulses;
+
+    if (!writeSDO(OD_MODES_OP, 0, 1, 1)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    sendControlWord(0x0F);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    uint32_t pv = (speed_rpm > 0 ? speed_rpm : config_.default_speed_rpm) * 10;
+    if (!writeSDO(OD_PROFILE_VELOCITY, 0, pv, 4)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    if (!writeSDO(OD_TARGET_POSITION, 0, static_cast<uint32_t>(pulses), 4)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    // PP 触发:bit4 上升沿 → 清除
+    if (!writeSDO(OD_CONTROLWORD, 0, 0x1F, 2)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!writeSDO(OD_CONTROLWORD, 0, 0x0F, 2)) return false;
+
+    std::cout << "[Motor] Moving to " << position_mm << " mm ("
+              << pulses << " pulses)" << std::endl;
+    return true;
+}
+
+bool MotorDriver::setSpeed(int speed_rpm) {
+    if (!connected_) return false;
+
+    // 速度限幅
+    if (speed_rpm > config_.max_speed_rpm) {
+        std::cerr << "[Motor] Speed clamped: " << speed_rpm << " -> " << config_.max_speed_rpm << " rpm" << std::endl;
+        speed_rpm = config_.max_speed_rpm;
+    } else if (speed_rpm < config_.min_speed_rpm) {
+        std::cerr << "[Motor] Speed clamped: " << speed_rpm << " -> " << config_.min_speed_rpm << " rpm" << std::endl;
+        speed_rpm = config_.min_speed_rpm;
+    }
+
+    if (pdo_mode_ && control_running_) {
+        stopPDOMode();
+    }
+
+    if (!writeSDO(OD_MODES_OP, 0, 3, 1)) return false;  // PV mode
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    sendControlWord(0x0F);
+    uint32_t speed = static_cast<uint32_t>(speed_rpm * 10);
+    return writeSDO(OD_TARGET_VELOCITY, 0, speed, 4);
+}
+
+bool MotorDriver::setZero() {
+    if (!connected_) return false;
+
+    bool was_pdo = false;
+    if (pdo_mode_ && control_running_) {
+        stopPDOMode();
+        was_pdo = true;
+    }
+
+    // homing method 35 = 不回零(设置当前位置为零点)
+    if (!writeSDO(OD_HOMING_METHOD, 0, 35, 1)) {
+        std::cerr << "[Motor] Failed to set homing method 35" << std::endl;
+        if (was_pdo) restartPDO();
+        return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    if (!writeSDO(OD_MODES_OP, 0, 6, 1)) {
+        std::cerr << "[Motor] Failed to switch to homing mode" << std::endl;
+        if (was_pdo) restartPDO();
+        return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    if (!sendControlWord(0x1F)) {
+        if (was_pdo) restartPDO();
+        return false;
+    }
+
+    // 等待 homing 完成 (bit12)
+    for (int i = 0; i < 20; i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        uint16_t sw;
+        if (readSDO16(OD_STATUSWORD, 0, sw)) {
+            if (sw & 0x1000) break;
+            if (sw & 0x2000) {
+                std::cerr << "[Motor] Homing error" << std::endl;
+                sendControlWord(0x0F);
+                writeSDO(OD_MODES_OP, 0, 1, 1);
+                if (was_pdo) restartPDO();
+                return false;
+            }
+        }
+    }
+
+    sendControlWord(0x0F);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    if (was_pdo) {
+        restartPDO();
+    } else {
+        if (!writeSDO(OD_MODES_OP, 0, 1, 1)) {
+            std::cerr << "[Motor] Failed to restore PP mode" << std::endl;
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        sendControlWord(0x0F);
+    }
+
+    std::cout << "[Motor] Zero position set" << std::endl;
+    return true;
+}
+
+void MotorDriver::restartPDO() {
+    if (!writeSDO(OD_MODES_OP, 0, 1, 1)) {
+        std::cerr << "[Motor] Failed to restore PP mode" << std::endl;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    sendControlWord(0x0F);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    uint32_t pos;
+    if (readSDO(OD_POSITION_ACTUAL, 0, pos)) {
+        pdo_target_position_ = static_cast<int32_t>(pos);
+    }
+    pdo_control_word_ = 0x0F;
+    pdo_trigger_pending_ = false;
+    {
+        std::lock_guard<std::mutex> lock(tpdo_time_mutex_);
+        last_tpdo_time_ = std::chrono::steady_clock::now();
+    }
+    startPDOMode();
+}
+
+bool MotorDriver::clearError() {
+    if (!connected_ && !pdo_mode_) return false;
+    std::cout << "[Motor] Clearing error" << std::endl;
+
+    if (pdo_mode_ && control_running_) {
+        pdo_control_word_ = 0x80;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        pdo_control_word_ = 0x06;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        pdo_control_word_ = 0x07;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        pdo_control_word_ = 0x0F;
+        return true;
+    }
+
+    if (!sendControlWord(0x80)) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    sendControlWord(0x06);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    sendControlWord(0x07);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    return sendControlWord(0x0F);
+}
+
+bool MotorDriver::resetDrive() {
+    if (!connected_) return false;
+    std::cout << "[Motor] Resetting drive" << std::endl;
+    return reconfigureDrive();
+}
+
+void MotorDriver::statusUpdateLoop() {
+    while (running_) {
+        updateStatus();
+        if (status_callback_) {
+            MotorStatus snapshot;
+            {
+                std::lock_guard<std::mutex> lock(status_mutex_);
+                snapshot = status_;
+            }
+            status_callback_(snapshot);
+        }
+        checkConnection();
+        int interval_ms = 1000 / config_.status_update_hz;
+        std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+    }
+}
+
+bool MotorDriver::updateStatus() {
+    if (!connected_) return false;
+
+    int failures = 0;
+    MotorStatus new_status = status_;
+
+    uint16_t status_word;
+    if (readSDO16(OD_STATUSWORD, 0, status_word)) {
+        new_status.status_word = status_word;
+        new_status.is_enabled = (status_word & 0x04) != 0;
+        new_status.target_reached = (status_word & 0x0400) != 0;
+        new_status.is_fault = (status_word & 0x08) != 0;
+    } else {
+        failures++;
+    }
+
+    uint16_t error_code;
+    if (readSDO16(OD_ERROR_CODE, 0, error_code)) {
+        new_status.error_code = error_code;
+    } else {
+        failures++;
+    }
+
+    uint32_t pos_pulses;
+    if (readSDO(OD_POSITION_ACTUAL, 0, pos_pulses)) {
+        new_status.position_pulses = static_cast<int32_t>(pos_pulses);
+    } else {
+        failures++;
+    }
+
+    uint32_t speed_01rpm;
+    if (readSDO(OD_VELOCITY_ACTUAL, 0, speed_01rpm)) {
+        new_status.speed_01rpm = static_cast<int32_t>(speed_01rpm);
+    } else {
+        failures++;
+    }
+
+    if (failures >= 3) {
+        std::cerr << "[Motor] Drive not responding (" << failures
+                  << "/4 SDO reads failed)" << std::endl;
+        connected_ = false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        status_ = new_status;
+    }
+    return failures == 0;
+}
+
+MotorStatus MotorDriver::getStatus() const {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    return status_;
+}
+
+int MotorDriver::getPositionMM() const {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    return status_.position_pulses / config_.mm_to_pulses;
+}
+
+int MotorDriver::getSpeedRPM() const {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    return status_.speed_01rpm / 10;
+}
+
+void MotorDriver::checkConnection() {
+    if (!can_iface_.is_connected()) {
+        connected_ = false;
+        if (tryReconnect()) std::cout << "[Motor] CAN reconnected" << std::endl;
+    } else if (!connected_) {
+        if (tryReconnect()) std::cout << "[Motor] Drive reconnected" << std::endl;
+    }
+}
+
+bool MotorDriver::tryReconnect() {
+    static auto last_attempt = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_attempt);
+    if (elapsed.count() < config_.reconnect_timeout_ms) return false;
+    last_attempt = now;
+
+    bool was_pdo = pdo_mode_ && control_running_;
+    if (was_pdo) stopPDOMode();
+
+    if (!can_iface_.is_connected()) {
+        if (!can_iface_.init()) return false;
+    }
+
+    // 临时置位以允许 SDO 探测(连接状态由 SDO 响应决定)
+    connected_ = true;
+
+    uint16_t status_word;
+    if (!readSDO16(OD_STATUSWORD, 0, status_word)) {
+        connected_ = false;  // SDO 失败,电机仍未响应
+        return false;
+    }
+
+    std::cout << "[Motor] Drive responding, reconfiguring..." << std::endl;
+
+    if (!reconfigureDrive()) {
+        std::cerr << "[Motor] Reconfigure failed" << std::endl;
+        connected_ = false;
+        return false;
+    }
+
+    if (config_.pdo_enabled) {
+        if (configurePDO()) {
+            pdo_mode_ = true;
+        } else {
+            pdo_mode_ = false;
+        }
+    }
+
+    if (!enable()) {
+        std::cerr << "[Motor] Re-enable failed" << std::endl;
+        connected_ = false;
+        return false;
+    }
+
+    if (pdo_mode_) {
+        uint32_t pos;
+        if (readSDO(OD_POSITION_ACTUAL, 0, pos)) {
+            pdo_target_position_ = static_cast<int32_t>(pos);
+        }
+        pdo_control_word_ = 0x0F;
+        pdo_trigger_pending_ = false;
+        {
+            std::lock_guard<std::mutex> lock(tpdo_time_mutex_);
+            last_tpdo_time_ = std::chrono::steady_clock::now();
+        }
+        startPDOMode();
+    } else if (!status_thread_.joinable()) {
+        status_thread_ = std::thread(&MotorDriver::statusUpdateLoop, this);
+    }
+
+    connected_ = true;
+    std::cout << "[Motor] Reconnected successfully" << std::endl;
+    return true;
+}
+
+void MotorDriver::setStatusCallback(std::function<void(const MotorStatus&)> callback) {
+    status_callback_ = callback;
+}
+
+} // namespace lift_controller
