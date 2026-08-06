@@ -20,6 +20,7 @@ struct MotorStatus {
     bool is_enabled;
     bool target_reached;
     bool is_fault;
+    bool following_error;  // bit13: 位置跟随误差超限
 };
 
 struct MotorConfig {
@@ -32,6 +33,8 @@ struct MotorConfig {
     int min_speed_rpm = 0;
     int accel_time_ms = 500;
     int decel_time_ms = 500;
+    int following_error_pulses = 100000;  // 跟随误差窗口(脉冲数),0=不限制
+    int max_motor_speed_rpm = 0;          // 电机最大转速(rpm),0=不设置(用驱动器内值)
     int reconnect_timeout_ms = 1000;
     int status_update_hz = 10;
     bool pdo_enabled = true;
@@ -58,6 +61,7 @@ public:
     bool updateStatus();
     int getPositionMM() const;
     int getSpeedRPM() const;
+    int getCurrentSpeedRPM() const { return current_speed_rpm_.load(); }
 
     void setConfig(const MotorConfig& config);
     const MotorConfig& getConfig() const { return config_; }
@@ -104,7 +108,10 @@ private:
     std::thread control_thread_;
     std::atomic<uint16_t> pdo_control_word_;
     std::atomic<int32_t> pdo_target_position_;
+    int32_t last_target_pulses_ = 0;  // 上次命令的目标位置(用于停止检测)
     std::atomic<bool> pdo_trigger_pending_;  // PP 模式 bit4 触发标志
+    std::atomic<int> pdo_bit4_remaining_{0};  // bit4 保持周期数(等驱动器回 bit12)
+    std::atomic<int> current_speed_rpm_;     // 当前 PP 模式运动速度(rpm)
 
     // 重连看门狗(PDO 模式下检测断电并自动重连)
     std::atomic<bool> reconnect_running_;

@@ -36,10 +36,13 @@ private:
     // Publishers
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr position_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr speed_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr speed_rpm_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr speed_percent_pub_;
     rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr error_code_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr enabled_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr target_reached_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr fault_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr following_error_pub_;
 
     // Subscribers
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr target_pos_sub_;
@@ -66,6 +69,8 @@ private:
         int min_speed_rpm = 0;
         int accel_time_ms = 500;
         int decel_time_ms = 500;
+        int following_error_pulses = 100000;  // 跟随误差窗口(脉冲数),0=用驱动器内值
+        int max_motor_speed_rpm = 0;          // 电机最大转速(rpm),0=用驱动器内值
         int status_update_hz = 10;
         int reconnect_timeout_ms = 1000;
         bool pdo_enabled = true;       // 是否启用 PDO 模式

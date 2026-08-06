@@ -81,10 +81,24 @@ ros2 topic echo /lift/position
 ```
 
 #### `lift/speed` — `std_msgs/Float64`
-升降当前速度，单位 rpm。
+升降当前实际速度（电机反馈），单位 rpm。PDO 模式下由 TPDO2 驱动 200Hz 发布。
 
 ```bash
 ros2 topic echo /lift/speed
+```
+
+#### `lift/speed_rpm` — `std_msgs/Float64`
+当前设定的运动速度（PP 模式 profile velocity），单位 rpm。通过 `lift/target_speed` 或 `lift/target_position_with_speed` 设置。
+
+```bash
+ros2 topic echo /lift/speed_rpm
+```
+
+#### `lift/speed_percent` — `std_msgs/Float64`
+当前设定速度占最大速度（`max_speed_rpm`）的百分比，范围 0~100。
+
+```bash
+ros2 topic echo /lift/speed_percent
 ```
 
 #### `lift/enabled` — `std_msgs/Bool`
@@ -198,6 +212,7 @@ ros2 topic list
 - PP 模式（Profile Position），驱动器内部处理轨迹
 - RPDO1：ControlWord + TargetPosition，200Hz 周期发送 + SYNC
 - TPDO1：StatusWord + PositionActual + ErrorCode，事件驱动反馈
+- TPDO2：VelocityActual，同步反馈（TPDO1 已满 8 字节，速度单独走 TPDO2）
 - 控制延迟 < 0.1ms
 
 ### SDO 模式（回退）
@@ -215,7 +230,7 @@ CanInterface (SocketCAN)
 MotorDriver
     ├── init: 读 F0.1.002 → 配置 PP → 配置 PDO → 使能
     ├── controlLoop (PDO): 200Hz 发送 RPDO + SYNC
-    └── handleTPDO: 解析 TPDO1 → statusCallback
+    └── handleTPDO: 解析 TPDO1(StatusWord/Position/ErrorCode) + TPDO2(Velocity) → statusCallback
 
 LiftController (ROS2 Node)
     ├── 发布: position/speed/enabled/target_reached/fault/error_code

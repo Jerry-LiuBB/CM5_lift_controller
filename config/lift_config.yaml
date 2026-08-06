@@ -6,11 +6,13 @@ lift_controller:
     mm_to_pulses: 1000
     max_position_mm: 500
     min_position_mm: 0
-    default_speed_rpm: 100
-    max_speed_rpm: 200
+    default_speed_rpm: 200
+    max_speed_rpm: 300
     min_speed_rpm: 0
-    accel_time_ms: 500
-    decel_time_ms: 500
+    accel_time_ms: 1000
+    decel_time_ms: 1000
+    following_error_pulses: 200000  # 跟随误差窗口(脉冲数),100000=100mm,0=用驱动器内值
+    max_motor_speed_rpm: 0          # 电机最大转速(rpm),0=用驱动器内值
     status_update_hz: 10
     reconnect_timeout_ms: 1000
     pdo_enabled: true

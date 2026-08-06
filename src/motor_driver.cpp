@@ -1,6 +1,7 @@
 #include "lift_controller/motor_driver.hpp"
 #include <iostream>
 #include <cstring>
+#include <cmath>
 #include <chrono>
 
 namespace lift_controller {
@@ -19,12 +20,17 @@ constexpr uint16_t OD_POSITION_ACTUAL = 0x6063;
 constexpr uint16_t OD_VELOCITY_ACTUAL = 0x606C;
 constexpr uint16_t OD_HOME_OFFSET     = 0x607C;
 constexpr uint16_t OD_HOMING_METHOD   = 0x6098;
+constexpr uint16_t OD_POSITION_LIMIT  = 0x607D;  // 软件位置限位
+constexpr uint16_t OD_FOLLOWING_ERR   = 0x6065;  // 跟随误差窗口
+constexpr uint16_t OD_MAX_MOTOR_SPEED = 0x6080;  // 电机最大转速
 
 // PDO 通信/映射参数
 constexpr uint16_t OD_RPDO1_COMM     = 0x1400;
 constexpr uint16_t OD_RPDO1_MAP      = 0x1600;
 constexpr uint16_t OD_TPDO1_COMM     = 0x1800;
 constexpr uint16_t OD_TPDO1_MAP      = 0x1A00;
+constexpr uint16_t OD_TPDO2_COMM     = 0x1801;
+constexpr uint16_t OD_TPDO2_MAP      = 0x1A01;
 
 // 驱动器厂商参数
 constexpr uint16_t OD_CONTROL_MODE    = 0x2102;  // F0.1.002: 20=CANopen模式
@@ -36,6 +42,7 @@ MotorDriver::MotorDriver(CanInterface& can_iface)
     pdo_control_word_ = 0;
     pdo_target_position_ = 0;
     pdo_trigger_pending_ = false;
+    current_speed_rpm_ = 0;
 }
 
 MotorDriver::~MotorDriver() { shutdown(); }
@@ -147,7 +154,72 @@ bool MotorDriver::reconfigureDrive() {
     if (config_.default_speed_rpm > 0) {
         writeSDO(OD_PROFILE_VELOCITY, 0,
                  static_cast<uint32_t>(config_.default_speed_rpm * 10), 4);
+        current_speed_rpm_ = config_.default_speed_rpm;
     }
+
+    // 设置驱动器软件位置限位(与 YAML 配置一致)
+    int32_t min_pulses = config_.min_position_mm * config_.mm_to_pulses;
+    int32_t max_pulses = config_.max_position_mm * config_.mm_to_pulses;
+    if (!writeSDO(OD_POSITION_LIMIT, 1, static_cast<uint32_t>(min_pulses), 4)) {
+        std::cerr << "[Motor] WARNING: Failed to set min position limit (0x607D:01)" << std::endl;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!writeSDO(OD_POSITION_LIMIT, 2, static_cast<uint32_t>(max_pulses), 4)) {
+        std::cerr << "[Motor] WARNING: Failed to set max position limit (0x607D:02)" << std::endl;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    // 设置跟随误差窗口(0x6065) — 高速运动时需要足够大的窗口
+    if (config_.following_error_pulses > 0) {
+        if (writeSDO(OD_FOLLOWING_ERR, 0,
+                     static_cast<uint32_t>(config_.following_error_pulses), 4)) {
+            // 读回验证
+            uint32_t few_read;
+            if (readSDO(OD_FOLLOWING_ERR, 0, few_read)) {
+                std::cout << "[Motor] Following error window: set=" << config_.following_error_pulses
+                          << ", readback=" << static_cast<int32_t>(few_read)
+                          << " (" << static_cast<int32_t>(few_read) / config_.mm_to_pulses << "mm)" << std::endl;
+                if (static_cast<int32_t>(few_read) != config_.following_error_pulses) {
+                    std::cerr << "[Motor] WARNING: Following error window readback mismatch! "
+                              << "Drive may cap the value." << std::endl;
+                }
+            } else {
+                std::cout << "[Motor] Following error window: " << config_.following_error_pulses
+                          << " pulses (readback failed)" << std::endl;
+            }
+        } else {
+            std::cerr << "[Motor] WARNING: Failed to set following error window (0x6065)" << std::endl;
+        }
+    } else {
+        uint32_t few;
+        if (readSDO(OD_FOLLOWING_ERR, 0, few)) {
+            std::cout << "[Motor] Current following error window: " << static_cast<int32_t>(few)
+                      << " pulses (" << static_cast<int32_t>(few) / config_.mm_to_pulses << "mm)" << std::endl;
+        }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    // 设置电机最大转速(0x6080)
+    if (config_.max_motor_speed_rpm > 0) {
+        writeSDO(OD_MAX_MOTOR_SPEED, 0,
+                 static_cast<uint32_t>(config_.max_motor_speed_rpm), 4);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    // 读回最大电机转速
+    uint32_t mms;
+    if (readSDO(OD_MAX_MOTOR_SPEED, 0, mms)) {
+        std::cout << "[Motor] Max motor speed: " << mms << " rpm" << std::endl;
+    }
+
+    // 读回验证位置限位
+    uint32_t read_min, read_max;
+    if (readSDO(OD_POSITION_LIMIT, 1, read_min) && readSDO(OD_POSITION_LIMIT, 2, read_max)) {
+        std::cout << "[Motor] Position limits: min=" << static_cast<int32_t>(read_min) / config_.mm_to_pulses
+                  << "mm, max=" << static_cast<int32_t>(read_max) / config_.mm_to_pulses << "mm" << std::endl;
+    } else {
+        std::cerr << "[Motor] WARNING: Cannot read back position limits — drive may not support 0x607D" << std::endl;
+    }
+
     return true;
 }
 
@@ -182,6 +254,18 @@ bool MotorDriver::configurePDO() {
     if (!writeSDO(OD_TPDO1_MAP, 3, 0x603F0010, 4)) return false;  // ErrorCode 16bit
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     if (!writeSDO(OD_TPDO1_MAP, 0, 3, 1)) return false;  // 启用(3个对象)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    // === TPDO2: VelocityActual(32) ===
+    // TPDO1 已满 8 字节,速度实际值单独走 TPDO2
+    if (!writeSDO(OD_TPDO2_COMM, 2, 1, 1)) return false;  // 传输类型=同步
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    if (!writeSDO(OD_TPDO2_MAP, 0, 0, 1)) return false;  // 禁用映射
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!writeSDO(OD_TPDO2_MAP, 1, 0x606C0020, 4)) return false;  // VelocityActual 32bit
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!writeSDO(OD_TPDO2_MAP, 0, 1, 1)) return false;  // 启用(1个对象)
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     // 进入 Operational
@@ -310,10 +394,14 @@ void MotorDriver::controlLoop() {
     auto next_deadline = std::chrono::steady_clock::now() + period;
 
     while (control_running_) {
-        // PP 模式:bit4 上升沿触发新位置命令
+        // PP 模式:bit4 保持 set 直到驱动器回 bit12(setpoint acknowledge)
         uint16_t cw = pdo_control_word_.load(std::memory_order_relaxed);
         if (pdo_trigger_pending_.exchange(false)) {
-            cw |= 0x10;  // set bit4 (new setpoint)
+            pdo_bit4_remaining_.store(50);  // 最多保持50个周期(250ms@200Hz)
+        }
+        if (pdo_bit4_remaining_.load() > 0) {
+            cw |= 0x10;  // 保持 bit4 set
+            pdo_bit4_remaining_.fetch_sub(1);
         }
 
         // 构建 RPDO: ControlWord(2) + TargetPosition(4) = 6 bytes
@@ -345,39 +433,79 @@ void MotorDriver::controlLoop() {
 }
 
 void MotorDriver::handleTPDO(const CanFrame& frame) {
-    if (frame.id != static_cast<uint32_t>(0x180 + config_.node_id)) return;
-    if (frame.dlc < 8) return;
+    // TPDO1: StatusWord(16) + PositionActual(32) + ErrorCode(16)
+    if (frame.id == static_cast<uint32_t>(0x180 + config_.node_id)) {
+        if (frame.dlc < 8) return;
 
-    uint16_t status_word;
-    int32_t position_actual;
-    uint16_t error_code;
-    std::memcpy(&status_word, &frame.data[0], 2);
-    std::memcpy(&position_actual, &frame.data[2], 4);
-    std::memcpy(&error_code, &frame.data[6], 2);
+        uint16_t status_word;
+        int32_t position_actual;
+        uint16_t error_code;
+        std::memcpy(&status_word, &frame.data[0], 2);
+        std::memcpy(&position_actual, &frame.data[2], 4);
+        std::memcpy(&error_code, &frame.data[6], 2);
 
-    MotorStatus new_status;
-    {
-        std::lock_guard<std::mutex> lock(status_mutex_);
-        new_status = status_;
+        MotorStatus new_status;
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            new_status = status_;
+        }
+        new_status.status_word = status_word;
+        new_status.position_pulses = position_actual;
+        new_status.error_code = error_code;
+        new_status.is_enabled = (status_word & 0x04) != 0;
+        new_status.target_reached = (status_word & 0x0400) != 0;
+        new_status.is_fault = (status_word & 0x08) != 0;
+        new_status.following_error = (status_word & 0x2000) != 0;
+
+        // bit12 (Setpoint Acknowledge) — 驱动器接受新目标后置位,收到后清除 bit4
+        if (status_word & 0x1000) {
+            pdo_bit4_remaining_.store(0);  // 驱动器已确认,停止发 bit4
+        }
+
+        // 停止检测:电机速度为0但未到达目标且无故障 — 打印诊断信息(每秒最多1次)
+        static auto last_stop_log = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+        if (new_status.speed_01rpm == 0 && !new_status.target_reached &&
+            !new_status.is_fault && last_target_pulses_ != 0 &&
+            std::abs(position_actual - last_target_pulses_) > config_.mm_to_pulses) {
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_stop_log).count() >= 1) {
+                last_stop_log = now;
+                int32_t remaining = (last_target_pulses_ - position_actual) / config_.mm_to_pulses;
+                std::cerr << "[Motor] STOPPED: pos=" << position_actual / config_.mm_to_pulses
+                          << "mm, target=" << last_target_pulses_ / config_.mm_to_pulses
+                          << "mm, remaining=" << remaining << "mm"
+                          << ", SW=0x" << std::hex << status_word << std::dec
+                          << ", follow_err=" << new_status.following_error
+                          << ", enabled=" << new_status.is_enabled << std::endl;
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            status_ = new_status;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(tpdo_time_mutex_);
+            last_tpdo_time_ = std::chrono::steady_clock::now();
+        }
+
+        if (status_callback_) status_callback_(new_status);
+        return;
     }
-    new_status.status_word = status_word;
-    new_status.position_pulses = position_actual;
-    new_status.error_code = error_code;
-    new_status.is_enabled = (status_word & 0x04) != 0;
-    new_status.target_reached = (status_word & 0x0400) != 0;
-    new_status.is_fault = (status_word & 0x08) != 0;
 
-    {
-        std::lock_guard<std::mutex> lock(status_mutex_);
-        status_ = new_status;
+    // TPDO2: VelocityActual(32)
+    if (frame.id == static_cast<uint32_t>(0x280 + config_.node_id)) {
+        if (frame.dlc < 4) return;
+        int32_t velocity_actual;
+        std::memcpy(&velocity_actual, &frame.data[0], 4);
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            status_.speed_01rpm = velocity_actual;
+        }
+        // 不触发 callback: TPDO1 会以 200Hz 触发 publishState,
+        // speed 在下一个 TPDO1 周期即可发布,避免重复发布
     }
-
-    {
-        std::lock_guard<std::mutex> lock(tpdo_time_mutex_);
-        last_tpdo_time_ = std::chrono::steady_clock::now();
-    }
-
-    if (status_callback_) status_callback_(new_status);
 }
 
 void MotorDriver::reconnectLoop() {
@@ -401,7 +529,12 @@ void MotorDriver::reconnectLoop() {
 bool MotorDriver::enable() {
     if (!connected_ && !pdo_mode_) return false;
 
+    // 先执行 fault reset(bit7=1),清除可能的残留故障
     if (pdo_mode_ && control_running_) {
+        pdo_control_word_ = 0x80;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        pdo_control_word_ = 0x00;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         pdo_control_word_ = 0x06;
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         pdo_control_word_ = 0x07;
@@ -411,6 +544,10 @@ bool MotorDriver::enable() {
         return true;
     }
 
+    sendControlWord(0x80);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    sendControlWord(0x00);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     if (!sendControlWord(0x06)) return false;
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     if (!sendControlWord(0x07)) return false;
@@ -441,14 +578,10 @@ bool MotorDriver::setPosition(int position_mm, int speed_rpm) {
         return false;
     }
 
-    // 速度限幅
-    if (speed_rpm > config_.max_speed_rpm) {
-        std::cerr << "[Motor] Speed clamped: " << speed_rpm << " -> " << config_.max_speed_rpm << " rpm" << std::endl;
-        speed_rpm = config_.max_speed_rpm;
-    } else if (speed_rpm < 0) {
-        std::cerr << "[Motor] Speed clamped: " << speed_rpm << " -> 0 rpm" << std::endl;
-        speed_rpm = 0;
-    }
+    // 确定有效速度: speed_rpm <= 0 表示使用当前速度(current_speed_rpm_)
+    int effective_speed = (speed_rpm > 0) ? speed_rpm : current_speed_rpm_.load();
+    if (effective_speed > config_.max_speed_rpm) effective_speed = config_.max_speed_rpm;
+    if (effective_speed < config_.min_speed_rpm) effective_speed = config_.min_speed_rpm;
 
     int32_t target_pulses = position_mm * config_.mm_to_pulses;
 
@@ -457,10 +590,10 @@ bool MotorDriver::setPosition(int position_mm, int speed_rpm) {
             std::cerr << "[Motor] Not connected, cannot set position" << std::endl;
             return false;
         }
-        // 如果控制循环未运行(setSpeed 后),重启 PDO
+        // 如果控制循环未运行,重启 PDO
         if (!control_running_) {
             if (!writeSDO(OD_MODES_OP, 0, 1, 1)) {
-                return setPositionSDO(position_mm, speed_rpm);
+                return setPositionSDO(position_mm, effective_speed);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             sendControlWord(0x0F);
@@ -473,22 +606,39 @@ bool MotorDriver::setPosition(int position_mm, int speed_rpm) {
             startPDOMode();
         }
 
-        // 设置速度(profile velocity, PP 模式用)
-        if (speed_rpm > 0) {
-            writeSDO(OD_PROFILE_VELOCITY, 0,
-                     static_cast<uint32_t>(speed_rpm * 10), 4);
+        // 始终通过 SDO 写入 profile velocity(PP 触发前写入,不干扰运动中 PDO)
+        uint32_t pv = static_cast<uint32_t>(effective_speed * 10);
+        bool pv_ok = writeSDO(OD_PROFILE_VELOCITY, 0, pv, 4);
+        current_speed_rpm_ = effective_speed;
+        if (!pv_ok) {
+            std::cerr << "[Motor] WARNING: Failed to write profile velocity!" << std::endl;
+        } else {
+            // 读回验证(确认驱动器实际接受了该速度)
+            uint32_t pv_read = 0;
+            if (readSDO(OD_PROFILE_VELOCITY, 0, pv_read)) {
+                int read_rpm = static_cast<int>(pv_read / 10);
+                std::cout << "[Motor] Profile velocity: requested=" << effective_speed
+                          << " rpm, readback=" << read_rpm << " rpm" << std::endl;
+                if (read_rpm != effective_speed) {
+                    std::cerr << "[Motor] WARNING: Speed readback mismatch! Drive may reject this speed." << std::endl;
+                }
+            }
         }
+
+        // 等待驱动器处理完 SDO 并恢复 PDO 处理
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
         // 更新目标位置并触发 bit4
         pdo_target_position_ = target_pulses;
+        last_target_pulses_ = target_pulses;
         pdo_trigger_pending_ = true;  // 下一个控制周期发 0x1F
 
         std::cout << "[Motor] PDO target: " << position_mm << " mm ("
-                  << target_pulses << " pulses)" << std::endl;
+                  << target_pulses << " pulses) at " << effective_speed << " rpm" << std::endl;
         return true;
     }
 
-    return setPositionSDO(position_mm, speed_rpm);
+    return setPositionSDO(position_mm, effective_speed);
 }
 
 bool MotorDriver::setPositionSDO(int position_mm, int speed_rpm) {
@@ -501,7 +651,8 @@ bool MotorDriver::setPositionSDO(int position_mm, int speed_rpm) {
     sendControlWord(0x0F);
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
-    uint32_t pv = (speed_rpm > 0 ? speed_rpm : config_.default_speed_rpm) * 10;
+    // speed_rpm 已由 setPosition() 计算为有效速度(clamped)
+    uint32_t pv = static_cast<uint32_t>(speed_rpm * 10);
     if (!writeSDO(OD_PROFILE_VELOCITY, 0, pv, 4)) return false;
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
@@ -514,7 +665,7 @@ bool MotorDriver::setPositionSDO(int position_mm, int speed_rpm) {
     if (!writeSDO(OD_CONTROLWORD, 0, 0x0F, 2)) return false;
 
     std::cout << "[Motor] Moving to " << position_mm << " mm ("
-              << pulses << " pulses)" << std::endl;
+              << pulses << " pulses) at " << speed_rpm << " rpm" << std::endl;
     return true;
 }
 
@@ -530,15 +681,11 @@ bool MotorDriver::setSpeed(int speed_rpm) {
         speed_rpm = config_.min_speed_rpm;
     }
 
-    if (pdo_mode_ && control_running_) {
-        stopPDOMode();
-    }
-
-    if (!writeSDO(OD_MODES_OP, 0, 3, 1)) return false;  // PV mode
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    sendControlWord(0x0F);
-    uint32_t speed = static_cast<uint32_t>(speed_rpm * 10);
-    return writeSDO(OD_TARGET_VELOCITY, 0, speed, 4);
+    // 只更新记录,不写 SDO — 实际 profile velocity 由 setPosition() 在 PP 触发前写入
+    // 这样避免运动中 SDO 写入干扰 PDO 通信
+    current_speed_rpm_ = speed_rpm;
+    std::cout << "[Motor] Speed set: " << speed_rpm << " rpm (effective on next move)" << std::endl;
+    return true;
 }
 
 bool MotorDriver::setZero() {
@@ -599,6 +746,13 @@ bool MotorDriver::setZero() {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         sendControlWord(0x0F);
     }
+
+    // 更新软件位置限位(以新零位为基准)
+    int32_t min_pulses = config_.min_position_mm * config_.mm_to_pulses;
+    int32_t max_pulses = config_.max_position_mm * config_.mm_to_pulses;
+    writeSDO(OD_POSITION_LIMIT, 1, static_cast<uint32_t>(min_pulses), 4);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    writeSDO(OD_POSITION_LIMIT, 2, static_cast<uint32_t>(max_pulses), 4);
 
     std::cout << "[Motor] Zero position set" << std::endl;
     return true;
@@ -683,6 +837,7 @@ bool MotorDriver::updateStatus() {
         new_status.is_enabled = (status_word & 0x04) != 0;
         new_status.target_reached = (status_word & 0x0400) != 0;
         new_status.is_fault = (status_word & 0x08) != 0;
+        new_status.following_error = (status_word & 0x2000) != 0;
     } else {
         failures++;
     }

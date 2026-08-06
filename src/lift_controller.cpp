@@ -19,10 +19,13 @@ LiftController::LiftController() : Node("lift_controller") {
     // 先创建所有 publisher(因 TPDO 回调会触发 publish,必须在 motor init 之前就绪)
     position_pub_ = this->create_publisher<std_msgs::msg::Float64>("lift/position", 10);
     speed_pub_ = this->create_publisher<std_msgs::msg::Float64>("lift/speed", 10);
+    speed_rpm_pub_ = this->create_publisher<std_msgs::msg::Float64>("lift/speed_rpm", 10);
+    speed_percent_pub_ = this->create_publisher<std_msgs::msg::Float64>("lift/speed_percent", 10);
     error_code_pub_ = this->create_publisher<std_msgs::msg::Int32>("lift/error_code", 10);
     enabled_pub_ = this->create_publisher<std_msgs::msg::Bool>("lift/enabled", 10);
     target_reached_pub_ = this->create_publisher<std_msgs::msg::Bool>("lift/target_reached", 10);
     fault_pub_ = this->create_publisher<std_msgs::msg::Bool>("lift/fault", 10);
+    following_error_pub_ = this->create_publisher<std_msgs::msg::Bool>("lift/following_error", 10);
 
     // Subscribers
     target_pos_sub_ = this->create_subscription<std_msgs::msg::Float64>(
@@ -61,6 +64,8 @@ LiftController::LiftController() : Node("lift_controller") {
     motor_config.min_speed_rpm = config_.min_speed_rpm;
     motor_config.accel_time_ms = config_.accel_time_ms;
     motor_config.decel_time_ms = config_.decel_time_ms;
+    motor_config.following_error_pulses = config_.following_error_pulses;
+    motor_config.max_motor_speed_rpm = config_.max_motor_speed_rpm;
     motor_config.reconnect_timeout_ms = config_.reconnect_timeout_ms;
     motor_config.status_update_hz = config_.status_update_hz;
     motor_config.pdo_enabled = config_.pdo_enabled;
@@ -77,10 +82,14 @@ LiftController::LiftController() : Node("lift_controller") {
     // 启动时使能电机(PDO 模式下 init 内已使能,此处为 SDO 回退模式的保险)
     motor_driver_->enable();
 
-    // State timer(SDO 回退模式的状态发布;PDO 模式下由 TPDO 回调驱动)
+    // State timer: SDO 回退模式的状态发布;PDO 模式下由 TPDO 回调驱动(定时器跳过)
     state_timer_ = this->create_wall_timer(
         std::chrono::milliseconds(1000 / config_.status_update_hz),
-        std::bind(&LiftController::publishState, this));
+        [this]() {
+            if (!motor_driver_ || !motor_driver_->isPDOMode()) {
+                publishState();
+            }
+        });
 
     RCLCPP_INFO(this->get_logger(), "Lift Controller started (%s mode)",
                 motor_driver_->isPDOMode() ? "PDO" : "SDO");
@@ -104,6 +113,8 @@ void LiftController::loadConfig() {
     this->declare_parameter("min_speed_rpm", 0);
     this->declare_parameter("accel_time_ms", 500);
     this->declare_parameter("decel_time_ms", 500);
+    this->declare_parameter("following_error_pulses", 100000);
+    this->declare_parameter("max_motor_speed_rpm", 0);
     this->declare_parameter("status_update_hz", 10);
     this->declare_parameter("reconnect_timeout_ms", 1000);
     this->declare_parameter("pdo_enabled", true);
@@ -120,6 +131,8 @@ void LiftController::loadConfig() {
     this->get_parameter("min_speed_rpm", config_.min_speed_rpm);
     this->get_parameter("accel_time_ms", config_.accel_time_ms);
     this->get_parameter("decel_time_ms", config_.decel_time_ms);
+    this->get_parameter("following_error_pulses", config_.following_error_pulses);
+    this->get_parameter("max_motor_speed_rpm", config_.max_motor_speed_rpm);
     this->get_parameter("status_update_hz", config_.status_update_hz);
     this->get_parameter("reconnect_timeout_ms", config_.reconnect_timeout_ms);
     this->get_parameter("pdo_enabled", config_.pdo_enabled);
@@ -149,6 +162,22 @@ void LiftController::publishState() {
     speed_msg.data = static_cast<double>(current_status_.speed_01rpm) / 10.0;
     speed_pub_->publish(speed_msg);
 
+    // 当前设定速度(rpm)及百分比(相对 max_speed_rpm)
+    auto speed_rpm_msg = std_msgs::msg::Float64();
+    auto speed_percent_msg = std_msgs::msg::Float64();
+    if (motor_driver_) {
+        int current_rpm = motor_driver_->getCurrentSpeedRPM();
+        speed_rpm_msg.data = static_cast<double>(current_rpm);
+        if (config_.max_speed_rpm > 0) {
+            speed_percent_msg.data =
+                (static_cast<double>(current_rpm) / config_.max_speed_rpm) * 100.0;
+        } else {
+            speed_percent_msg.data = 0.0;
+        }
+    }
+    speed_rpm_pub_->publish(speed_rpm_msg);
+    speed_percent_pub_->publish(speed_percent_msg);
+
     auto error_msg = std_msgs::msg::Int32();
     error_msg.data = current_status_.error_code;
     error_code_pub_->publish(error_msg);
@@ -164,6 +193,10 @@ void LiftController::publishState() {
     auto fault_msg = std_msgs::msg::Bool();
     fault_msg.data = current_status_.is_fault;
     fault_pub_->publish(fault_msg);
+
+    auto follow_err_msg = std_msgs::msg::Bool();
+    follow_err_msg.data = current_status_.following_error;
+    following_error_pub_->publish(follow_err_msg);
 }
 
 void LiftController::setPositionCallback(const std_msgs::msg::Float64::SharedPtr msg) {
