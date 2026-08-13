@@ -27,6 +27,11 @@ LiftController::LiftController() : Node("lift_controller") {
     fault_pub_ = this->create_publisher<std_msgs::msg::Bool>("lift/fault", 10);
     following_error_pub_ = this->create_publisher<std_msgs::msg::Bool>("lift/following_error", 10);
 
+    // 版本信息使用 latched QoS — 后订阅的节点也能立即收到
+    rclcpp::QoS latched_qos(rclcpp::KeepLast(1));
+    latched_qos.transient_local();
+    version_pub_ = this->create_publisher<std_msgs::msg::String>("lift/version_info", latched_qos);
+
     // Subscribers
     target_pos_sub_ = this->create_subscription<std_msgs::msg::Float64>(
         "lift/target_position", 10,
@@ -81,6 +86,12 @@ LiftController::LiftController() : Node("lift_controller") {
 
     // 启动时使能电机(PDO 模式下 init 内已使能,此处为 SDO 回退模式的保险)
     motor_driver_->enable();
+
+    // 发布驱动器版本信息(latched)
+    auto ver_msg = std_msgs::msg::String();
+    ver_msg.data = motor_driver_->getVersion();
+    version_pub_->publish(ver_msg);
+    RCLCPP_INFO(this->get_logger(), "Drive version: %s", ver_msg.data.c_str());
 
     // State timer: SDO 回退模式的状态发布;PDO 模式下由 TPDO 回调驱动(定时器跳过)
     state_timer_ = this->create_wall_timer(

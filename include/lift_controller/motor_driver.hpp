@@ -9,6 +9,7 @@
 #include <chrono>
 #include <iostream>
 #include <cstring>
+#include <string>
 
 namespace lift_controller {
 
@@ -62,6 +63,7 @@ public:
     int getPositionMM() const;
     int getSpeedRPM() const;
     int getCurrentSpeedRPM() const { return current_speed_rpm_.load(); }
+    std::string getVersion() const { return version_info_; }
 
     void setConfig(const MotorConfig& config);
     const MotorConfig& getConfig() const { return config_; }
@@ -82,6 +84,7 @@ private:
     void checkConnection();
     bool reconfigureDrive();
     bool setPositionSDO(int position_mm, int speed_rpm);
+    void readVersionInfo();  // 读取驱动器版本信息(0x1018)
 
     // PDO 模式
     bool configurePDO();
@@ -119,6 +122,8 @@ private:
 
     std::chrono::steady_clock::time_point last_tpdo_time_;
     mutable std::mutex tpdo_time_mutex_;
+
+    std::string version_info_;  // 驱动器版本信息
 };
 
 } // namespace lift_controller

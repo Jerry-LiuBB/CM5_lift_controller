@@ -23,6 +23,10 @@ constexpr uint16_t OD_HOMING_METHOD   = 0x6098;
 constexpr uint16_t OD_POSITION_LIMIT  = 0x607D;  // 软件位置限位
 constexpr uint16_t OD_FOLLOWING_ERR   = 0x6065;  // 跟随误差窗口
 constexpr uint16_t OD_MAX_MOTOR_SPEED = 0x6080;  // 电机最大转速
+constexpr uint16_t OD_D18_VERSION     = 0x5018;  // D18: 驱动器版本信息(A轴)
+constexpr uint16_t OD_D19_VERSION     = 0x5019;  // D19: 驱动器版本信息(A轴)
+constexpr uint16_t OD_POSITION_WINDOW = 0x6068;  // 位置窗口(到达判定的脉冲范围)
+constexpr uint16_t OD_F020E_POS_DEV   = 0x220E;  // F0.2.014: 厂商位置到达偏差
 
 // PDO 通信/映射参数
 constexpr uint16_t OD_RPDO1_COMM     = 0x1400;
@@ -80,6 +84,19 @@ bool MotorDriver::init(const MotorConfig& config) {
         return false;
     }
 
+    // 读取驱动器版本信息
+    readVersionInfo();
+
+    // 读取位置窗口参数(诊断用)
+    uint32_t pos_window = 0, pos_dev = 0;
+    if (readSDO(OD_POSITION_WINDOW, 0, pos_window)) {
+        std::cout << "[Motor] Position window (0x6068): " << static_cast<int32_t>(pos_window)
+                  << " pulses (" << static_cast<int32_t>(pos_window) / config_.mm_to_pulses << "mm)" << std::endl;
+    }
+    if (readSDO(OD_F020E_POS_DEV, 0, pos_dev)) {
+        std::cout << "[Motor] Position deviation (0x220E/F0.2.014): " << static_cast<int32_t>(pos_dev) << std::endl;
+    }
+
     // 尝试 PDO 模式
     if (config_.pdo_enabled) {
         if (configurePDO()) {
@@ -129,6 +146,27 @@ bool MotorDriver::init(const MotorConfig& config) {
     std::cout << "[Motor] Initialized, Node: " << config_.node_id
               << (pdo_mode_ ? " (PDO)" : " (SDO)") << std::endl;
     return true;
+}
+
+void MotorDriver::readVersionInfo() {
+    // 读取 D18(0x5018) 和 D19(0x5019) — 驱动器版本信息
+    uint32_t d18 = 0, d19 = 0;
+    bool ok18 = readSDO(OD_D18_VERSION, 0, d18);
+    bool ok19 = readSDO(OD_D19_VERSION, 0, d19);
+
+    if (ok18 || ok19) {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "D18=0x%08X(%u), D19=0x%08X(%u)",
+                 d18, d18, d19, d19);
+        version_info_ = buf;
+        std::cout << "[Motor] Version: " << version_info_ << std::endl;
+        if (!ok18) std::cerr << "[Motor] WARNING: Failed to read D18 (0x5018)" << std::endl;
+        if (!ok19) std::cerr << "[Motor] WARNING: Failed to read D19 (0x5019)" << std::endl;
+    } else {
+        version_info_ = "Unknown (SDO read failed)";
+        std::cerr << "[Motor] WARNING: Failed to read version info (D18/D19)" << std::endl;
+    }
 }
 
 bool MotorDriver::reconfigureDrive() {
@@ -218,6 +256,13 @@ bool MotorDriver::reconfigureDrive() {
                   << "mm, max=" << static_cast<int32_t>(read_max) / config_.mm_to_pulses << "mm" << std::endl;
     } else {
         std::cerr << "[Motor] WARNING: Cannot read back position limits — drive may not support 0x607D" << std::endl;
+    }
+
+    // 设置位置窗口(0x6068) — 实际位置在此范围内时 target reached 置位
+    if (writeSDO(OD_POSITION_WINDOW, 0, 100, 4)) {
+        std::cout << "[Motor] Position window (0x6068): set to 100 pulses" << std::endl;
+    } else {
+        std::cerr << "[Motor] WARNING: Failed to set position window (0x6068)" << std::endl;
     }
 
     return true;

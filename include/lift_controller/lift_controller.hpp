@@ -6,6 +6,7 @@
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/int32.hpp>
+#include <std_msgs/msg/string.hpp>
 #include "lift_controller/motor_driver.hpp"
 
 namespace lift_controller {
@@ -43,6 +44,7 @@ private:
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr target_reached_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr fault_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr following_error_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr version_pub_;  // 驱动器版本信息(latched)
 
     // Subscribers
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr target_pos_sub_;
