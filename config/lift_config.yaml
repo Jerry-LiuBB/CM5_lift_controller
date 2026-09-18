@@ -17,3 +17,9 @@ lift_controller:
     reconnect_timeout_ms: 1000
     pdo_enabled: true
     pdo_frequency_hz: 200
+    limit_safety_enabled: true
+    power_board_status_topic: "/power_board/status"
+    limit_1_direction: "min"       # LIMIT_1 触发后禁止继续向 min_position_mm 方向运动
+    limit_2_direction: "max"       # LIMIT_2 触发后禁止继续向 max_position_mm 方向运动
+    limit_stop_on_power_board_fault: true
+    limit_status_timeout_sec: 0.5

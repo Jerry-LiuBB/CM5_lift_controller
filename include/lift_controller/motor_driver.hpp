@@ -54,6 +54,7 @@ public:
     bool disable();
     bool setSpeed(int speed_rpm);
     bool setPosition(int position_mm, int speed_rpm = 0);
+    bool stopMotion();
     bool setZero();
     bool clearError();
     bool resetDrive();

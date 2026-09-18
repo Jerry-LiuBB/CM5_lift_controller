@@ -1,6 +1,32 @@
 #include "lift_controller/lift_controller.hpp"
 
 namespace lift_controller {
+namespace {
+
+int parseLimitDirection(const std::string& direction, const std::string& name,
+                        const rclcpp::Logger& logger) {
+    if (direction == "min" || direction == "lower" || direction == "negative") {
+        return -1;
+    }
+    if (direction == "max" || direction == "upper" || direction == "positive") {
+        return 1;
+    }
+    if (direction == "none" || direction == "disabled") {
+        return 0;
+    }
+    RCLCPP_WARN(logger,
+                "%s direction '%s' is invalid; expected min/max/none, using none",
+                name.c_str(), direction.c_str());
+    return 0;
+}
+
+const char* directionName(int direction) {
+    if (direction < 0) return "min";
+    if (direction > 0) return "max";
+    return "none";
+}
+
+}  // namespace
 
 LiftController::LiftController() : Node("lift_controller") {
     loadConfig();
@@ -26,6 +52,7 @@ LiftController::LiftController() : Node("lift_controller") {
     target_reached_pub_ = this->create_publisher<std_msgs::msg::Bool>("lift/target_reached", 10);
     fault_pub_ = this->create_publisher<std_msgs::msg::Bool>("lift/fault", 10);
     following_error_pub_ = this->create_publisher<std_msgs::msg::Bool>("lift/following_error", 10);
+    limit_stop_pub_ = this->create_publisher<std_msgs::msg::Bool>("lift/limit_stop", 10);
 
     // 版本信息使用 latched QoS — 后订阅的节点也能立即收到
     rclcpp::QoS latched_qos(rclcpp::KeepLast(1));
@@ -56,6 +83,12 @@ LiftController::LiftController() : Node("lift_controller") {
     clear_error_sub_ = this->create_subscription<std_msgs::msg::Bool>(
         "lift/clear_error_cmd", 10,
         std::bind(&LiftController::clearErrorCallback, this, std::placeholders::_1));
+
+    if (limit_safety_enabled_) {
+        power_board_status_sub_ = this->create_subscription<power_board_msgs::msg::PowerBoardStatus>(
+            power_board_status_topic_, 10,
+            std::bind(&LiftController::powerBoardStatusCallback, this, std::placeholders::_1));
+    }
 
     // 初始化电机驱动器(init 内会启动 PDO 控制循环,TPDO 回调将触发 publish)
     motor_driver_ = std::make_unique<MotorDriver>(*can_interface_);
@@ -97,6 +130,7 @@ LiftController::LiftController() : Node("lift_controller") {
     state_timer_ = this->create_wall_timer(
         std::chrono::milliseconds(1000 / config_.status_update_hz),
         [this]() {
+            checkLimitStatusTimeout();
             if (!motor_driver_ || !motor_driver_->isPDOMode()) {
                 publishState();
             }
@@ -130,6 +164,12 @@ void LiftController::loadConfig() {
     this->declare_parameter("reconnect_timeout_ms", 1000);
     this->declare_parameter("pdo_enabled", true);
     this->declare_parameter("pdo_frequency_hz", 200);
+    this->declare_parameter("limit_safety_enabled", true);
+    this->declare_parameter("power_board_status_topic", "/power_board/status");
+    this->declare_parameter("limit_1_direction", "min");
+    this->declare_parameter("limit_2_direction", "max");
+    this->declare_parameter("limit_stop_on_power_board_fault", true);
+    this->declare_parameter("limit_status_timeout_sec", 0.5);
 
     this->get_parameter("can_interface", config_.can_interface);
     this->get_parameter("can_bitrate", config_.can_bitrate);
@@ -148,6 +188,17 @@ void LiftController::loadConfig() {
     this->get_parameter("reconnect_timeout_ms", config_.reconnect_timeout_ms);
     this->get_parameter("pdo_enabled", config_.pdo_enabled);
     this->get_parameter("pdo_frequency_hz", config_.pdo_frequency_hz);
+    this->get_parameter("limit_safety_enabled", limit_safety_enabled_);
+    this->get_parameter("power_board_status_topic", power_board_status_topic_);
+    this->get_parameter("limit_1_direction", limit_1_direction_);
+    this->get_parameter("limit_2_direction", limit_2_direction_);
+    this->get_parameter("limit_stop_on_power_board_fault", limit_stop_on_power_board_fault_);
+    this->get_parameter("limit_status_timeout_sec", limit_status_timeout_sec_);
+
+    limit_1_block_direction_ =
+        parseLimitDirection(limit_1_direction_, "limit_1_direction", this->get_logger());
+    limit_2_block_direction_ =
+        parseLimitDirection(limit_2_direction_, "limit_2_direction", this->get_logger());
 }
 
 void LiftController::statusCallback(const MotorStatus& status) {
@@ -210,6 +261,171 @@ void LiftController::publishState() {
     following_error_pub_->publish(follow_err_msg);
 }
 
+void LiftController::powerBoardStatusCallback(
+    const power_board_msgs::msg::PowerBoardStatus::SharedPtr msg) {
+    if (!limit_safety_enabled_) return;
+
+    const bool limit_1_enabled = limit_1_block_direction_ != 0;
+    const bool limit_2_enabled = limit_2_block_direction_ != 0;
+    const bool limit_1_invalid = limit_1_enabled && !msg->limit_1_valid;
+    const bool limit_2_invalid = limit_2_enabled && !msg->limit_2_valid;
+    const bool limit_1_triggered = msg->limit_1_triggered && limit_1_enabled;
+    const bool limit_2_triggered = msg->limit_2_triggered && limit_2_enabled;
+
+    bool active = limit_1_triggered || limit_2_triggered;
+    std::string reason;
+    if (limit_1_triggered && limit_2_triggered) {
+        reason = "LIMIT_1 and LIMIT_2 triggered";
+    } else if (limit_1_triggered) {
+        reason = "LIMIT_1 triggered";
+    } else if (limit_2_triggered) {
+        reason = "LIMIT_2 triggered";
+    }
+
+    if (limit_1_invalid || limit_2_invalid) {
+        active = true;
+        if (limit_1_invalid && limit_2_invalid) {
+            reason = "LIMIT_1 and LIMIT_2 inputs invalid";
+        } else if (limit_1_invalid) {
+            reason = "LIMIT_1 input invalid";
+        } else {
+            reason = "LIMIT_2 input invalid";
+        }
+    } else if (limit_stop_on_power_board_fault_) {
+        if (!msg->communication_ok) {
+            active = true;
+            reason = "power board communication fault: " + msg->last_error;
+        } else if (msg->acquisition_stalled) {
+            active = true;
+            reason = "power board acquisition stalled";
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(limit_mutex_);
+        have_power_board_status_ = true;
+        last_power_board_status_time_ = this->now();
+        limit_1_active_ = limit_1_triggered;
+        limit_2_active_ = limit_2_triggered;
+        limit_safety_fault_active_ =
+            limit_1_invalid || limit_2_invalid ||
+            (limit_stop_on_power_board_fault_ &&
+             (!msg->communication_ok || msg->acquisition_stalled));
+    }
+
+    setLimitStopState(active, reason);
+}
+
+bool LiftController::rejectPositionIfBlockedByLimit(
+    const char* command_name, int target_pos_mm) {
+    std::lock_guard<std::mutex> lock(limit_mutex_);
+    if (!limit_safety_enabled_) return false;
+
+    if (limit_safety_fault_active_) {
+        RCLCPP_WARN(this->get_logger(), "%s ignored: lift safety fault is active (%s)",
+                    command_name, limit_stop_reason_.c_str());
+        return true;
+    }
+
+    int current_pos_mm = 0;
+    {
+        std::lock_guard<std::mutex> status_lock(status_mutex_);
+        current_pos_mm = current_status_.position_pulses / config_.mm_to_pulses;
+    }
+
+    int requested_direction = 0;
+    if (target_pos_mm > current_pos_mm) {
+        requested_direction = 1;
+    } else if (target_pos_mm < current_pos_mm) {
+        requested_direction = -1;
+    }
+
+    if (requested_direction == 0) return false;
+
+    const bool limit_1_blocks =
+        limit_1_active_ && limit_1_block_direction_ == requested_direction;
+    const bool limit_2_blocks =
+        limit_2_active_ && limit_2_block_direction_ == requested_direction;
+    if (!limit_1_blocks && !limit_2_blocks) return false;
+
+    std::string reason;
+    if (limit_1_blocks && limit_2_blocks) {
+        reason = "LIMIT_1 and LIMIT_2 block " + std::string(directionName(requested_direction)) +
+                 " direction";
+    } else if (limit_1_blocks) {
+        reason = "LIMIT_1 blocks " + std::string(directionName(requested_direction)) +
+                 " direction";
+    } else {
+        reason = "LIMIT_2 blocks " + std::string(directionName(requested_direction)) +
+                 " direction";
+    }
+    RCLCPP_WARN(this->get_logger(),
+                "%s ignored: %s (current=%d mm, target=%d mm)",
+                command_name, reason.c_str(), current_pos_mm, target_pos_mm);
+    return true;
+}
+
+bool LiftController::rejectCommandIfSafetyFault(const char* command_name) {
+    std::lock_guard<std::mutex> lock(limit_mutex_);
+    if (!limit_safety_enabled_ || !limit_safety_fault_active_) return false;
+    RCLCPP_WARN(this->get_logger(), "%s ignored: lift safety fault is active (%s)",
+                command_name, limit_stop_reason_.c_str());
+    return true;
+}
+
+void LiftController::setLimitStopState(bool active, const std::string& reason) {
+    if (!limit_safety_enabled_) return;
+
+    bool rising_edge = false;
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(limit_mutex_);
+        rising_edge = active && !limit_stop_active_;
+        changed = active != limit_stop_active_;
+        limit_stop_active_ = active;
+        limit_stop_reason_ = active ? reason : "";
+        if (!active) {
+            limit_safety_fault_active_ = false;
+        }
+    }
+
+    if (rising_edge) {
+        RCLCPP_ERROR(this->get_logger(), "Lift limit stop active: %s", reason.c_str());
+        if (motor_driver_) {
+            motor_driver_->stopMotion();
+        }
+    } else if (changed) {
+        RCLCPP_INFO(this->get_logger(), "Lift limit stop cleared");
+    }
+
+    if (changed && limit_stop_pub_) {
+        auto msg = std_msgs::msg::Bool();
+        msg.data = active;
+        limit_stop_pub_->publish(msg);
+    }
+}
+
+void LiftController::checkLimitStatusTimeout() {
+    if (!limit_safety_enabled_ || limit_status_timeout_sec_ <= 0.0) return;
+
+    bool timed_out = false;
+    {
+        std::lock_guard<std::mutex> lock(limit_mutex_);
+        if (have_power_board_status_) {
+            timed_out = (this->now() - last_power_board_status_time_).seconds() >
+                        limit_status_timeout_sec_;
+        }
+    }
+
+    if (timed_out) {
+        {
+            std::lock_guard<std::mutex> lock(limit_mutex_);
+            limit_safety_fault_active_ = true;
+        }
+        setLimitStopState(true, "power board status timeout");
+    }
+}
+
 void LiftController::setPositionCallback(const std_msgs::msg::Float64::SharedPtr msg) {
     int pos_mm = static_cast<int>(msg->data);
     if (pos_mm < config_.min_position_mm || pos_mm > config_.max_position_mm) {
@@ -217,6 +433,7 @@ void LiftController::setPositionCallback(const std_msgs::msg::Float64::SharedPtr
                     pos_mm, config_.min_position_mm, config_.max_position_mm);
         return;
     }
+    if (rejectPositionIfBlockedByLimit("target_position", pos_mm)) return;
     RCLCPP_INFO(this->get_logger(), "Moving to position: %d mm", pos_mm);
     motor_driver_->setPosition(pos_mm);
 }
@@ -243,6 +460,7 @@ void LiftController::setPositionWithSpeedCallback(const std_msgs::msg::Float64Mu
                     pos_mm, config_.min_position_mm, config_.max_position_mm);
         return;
     }
+    if (rejectPositionIfBlockedByLimit("target_position_with_speed", pos_mm)) return;
     if (speed_rpm > config_.max_speed_rpm || speed_rpm < config_.min_speed_rpm) {
         RCLCPP_WARN(this->get_logger(), "Speed %d rpm out of range [%d, %d], clamped",
                     speed_rpm, config_.min_speed_rpm, config_.max_speed_rpm);
@@ -253,6 +471,7 @@ void LiftController::setPositionWithSpeedCallback(const std_msgs::msg::Float64Mu
 
 void LiftController::enableCallback(const std_msgs::msg::Bool::SharedPtr msg) {
     if (msg->data) {
+        if (rejectCommandIfSafetyFault("enable_cmd")) return;
         motor_driver_->enable();
     } else {
         motor_driver_->disable();
@@ -261,6 +480,7 @@ void LiftController::enableCallback(const std_msgs::msg::Bool::SharedPtr msg) {
 
 void LiftController::setZeroCallback(const std_msgs::msg::Bool::SharedPtr msg) {
     if (msg->data) {
+        if (rejectCommandIfSafetyFault("zero_cmd")) return;
         motor_driver_->setZero();
     }
 }

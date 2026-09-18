@@ -674,6 +674,7 @@ bool MotorDriver::setPosition(int position_mm, int speed_rpm) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
         // 更新目标位置并触发 bit4
+        pdo_control_word_ = 0x0F;  // clear halt before accepting a new move
         pdo_target_position_ = target_pulses;
         last_target_pulses_ = target_pulses;
         pdo_trigger_pending_ = true;  // 下一个控制周期发 0x1F
@@ -684,6 +685,34 @@ bool MotorDriver::setPosition(int position_mm, int speed_rpm) {
     }
 
     return setPositionSDO(position_mm, effective_speed);
+}
+
+bool MotorDriver::stopMotion() {
+    if (!connected_ && !pdo_mode_) return false;
+
+    MotorStatus snapshot;
+    {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        snapshot = status_;
+    }
+
+    if (pdo_mode_ && control_running_) {
+        pdo_target_position_ = snapshot.position_pulses;
+        last_target_pulses_ = snapshot.position_pulses;
+        pdo_trigger_pending_ = false;
+        pdo_bit4_remaining_.store(0);
+        pdo_control_word_ = 0x010F;  // CiA 402 halt, keep operation enabled
+        std::cout << "[Motor] Motion halted at "
+                  << snapshot.position_pulses / config_.mm_to_pulses << " mm" << std::endl;
+        return true;
+    }
+
+    if (!connected_) return false;
+    bool ok = sendControlWord(0x010F);
+    if (ok) {
+        std::cout << "[Motor] Motion halt requested" << std::endl;
+    }
+    return ok;
 }
 
 bool MotorDriver::setPositionSDO(int position_mm, int speed_rpm) {

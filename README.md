@@ -8,6 +8,7 @@
 - **SDO 回退模式**：PDO 配置失败时自动回退到 SDO 模式（~10Hz），保证可用性
 - **队列式 CAN 接收**：SDO 响应入队 + condition_variable 等待，避免竞态条件
 - **断电重连**：电机掉电后自动检测并重连
+- **限位安全联锁**：订阅电源板限位状态，LIMIT_1/LIMIT_2 触发时立即停止升降运动
 - **余弦插值轨迹**：S 型加减速，平滑运动
 - **全部参数可配置**：通过 YAML 配置文件加载
 
@@ -22,7 +23,7 @@
 
 ```bash
 cd ~/workspace/ros2_ws
-colcon build --packages-select lift_controller
+colcon build --packages-up-to lift_controller
 source install/setup.bash
 ```
 
@@ -67,6 +68,12 @@ ros2 launch lift_controller lift_motor.launch.py
 | `reconnect_timeout_ms` | int | `1000` | 断电重连超时 (ms) |
 | `pdo_enabled` | bool | `true` | 是否启用 PDO 模式 |
 | `pdo_frequency_hz` | int | `200` | PDO 控制循环频率 (Hz) |
+| `limit_safety_enabled` | bool | `true` | 是否启用电源板限位安全联锁 |
+| `power_board_status_topic` | string | `"/power_board/status"` | 电源板状态话题 |
+| `limit_1_direction` | string | `"min"` | LIMIT_1 对应的限位方向；`min` 表示禁止继续向 `min_position_mm` 方向运动，`max` 表示禁止继续向 `max_position_mm` 方向运动，`none` 表示不参与限位保护 |
+| `limit_2_direction` | string | `"max"` | LIMIT_2 对应的限位方向；现场接线相反时可与 `limit_1_direction` 对调 |
+| `limit_stop_on_power_board_fault` | bool | `true` | 电源板通信异常或采集停滞时是否停车 |
+| `limit_status_timeout_sec` | double | `0.5` | 已收到过电源板状态后，状态超时多久触发安全停车；小于等于 0 表示禁用超时检测 |
 
 ## 话题
 
@@ -129,7 +136,17 @@ ros2 topic echo /lift/fault
 ros2 topic echo /lift/error_code
 ```
 
+#### `lift/limit_stop` — `std_msgs/Bool`
+限位安全停车状态。`true` 表示 LIMIT_1、LIMIT_2、电源板通信异常、采集停滞或状态超时触发了安全停车。限位触发后会立即请求停车；之后只拒绝继续朝触发限位方向的目标位置命令，允许反方向目标位置用于退出限位。
+
+```bash
+ros2 topic echo /lift/limit_stop
+```
+
 ### 订阅的话题（节点输入）
+
+#### `/power_board/status` — `power_board_msgs/PowerBoardStatus`
+电源板状态输入。升降节点读取其中的 `limit_1_triggered` 和 `limit_2_triggered`，任一限位触发时立即请求电机停车，并按 `limit_1_direction` / `limit_2_direction` 判断后续目标位置是否允许反向退出。
 
 #### `lift/target_position` — `std_msgs/Float64`
 设置目标位置，单位 mm。范围 `min_position_mm` ~ `max_position_mm`。
