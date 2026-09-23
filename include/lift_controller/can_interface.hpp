@@ -32,7 +32,7 @@ struct CanFrame {
 
 class CanInterface {
 public:
-    explicit CanInterface(const std::string& interface = "can0");
+    explicit CanInterface(const std::string& interface = "can1");
     ~CanInterface();
 
     bool init(int bitrate = 1000000);

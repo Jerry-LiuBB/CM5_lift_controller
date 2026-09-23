@@ -147,7 +147,7 @@ LiftController::~LiftController() {
 }
 
 void LiftController::loadConfig() {
-    this->declare_parameter("can_interface", "can0");
+    this->declare_parameter("can_interface", "can1");
     this->declare_parameter("can_bitrate", 1000000);
     this->declare_parameter("node_id", 1);
     this->declare_parameter("mm_to_pulses", 1000);

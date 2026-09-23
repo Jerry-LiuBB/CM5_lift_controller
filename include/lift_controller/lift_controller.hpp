@@ -84,7 +84,7 @@ private:
     std::string limit_stop_reason_;
 
     struct Config {
-        std::string can_interface = "can0";
+        std::string can_interface = "can1";
         int can_bitrate = 1000000;  // 期望的 CAN 波特率(实际由 ip link 设置,此处仅作配置/提示)
         int node_id = 1;
         int mm_to_pulses = 1000;

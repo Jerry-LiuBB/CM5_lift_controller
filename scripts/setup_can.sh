@@ -1,9 +1,9 @@
 #!/bin/bash
 # 配置 CAN 接口用于升降电机控制
 # 用法: sudo bash setup_can.sh [接口名] [波特率]
-#   默认: can0 1000000 (1 Mbps)
+#   默认: can1 1000000 (1 Mbps)
 
-INTERFACE=${1:-can0}
+INTERFACE=${1:-can1}
 BITRATE=${2:-1000000}
 
 if [ "$(id -u)" -ne 0 ]; then

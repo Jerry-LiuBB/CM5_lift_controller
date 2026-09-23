@@ -1,23 +1,48 @@
 # lift_controller
 
-基于 ROS2 的升降电机控制包，通过 CANopen (CiA 402) 协议控制 DS/RS 系列伺服/步进驱动器，支持 200Hz 高频 PDO 实时控制。
+基于 ROS 2 的升降电机控制包，通过 CANopen (CiA 402) 协议控制 DS/RS 系列伺服或步进驱动器。默认使用 `can1` 连接升降电机，支持 PDO 高频控制和 SDO 回退控制。
 
-## 功能特性
+## 功能概览
 
-- **PDO 高频控制**：CSP/PP 模式 + RPDO1 + TPDO1 + SYNC，控制频率可达 200Hz
-- **SDO 回退模式**：PDO 配置失败时自动回退到 SDO 模式（~10Hz），保证可用性
-- **队列式 CAN 接收**：SDO 响应入队 + condition_variable 等待，避免竞态条件
-- **断电重连**：电机掉电后自动检测并重连
-- **限位安全联锁**：订阅电源板限位状态，LIMIT_1/LIMIT_2 触发时立即停止升降运动
-- **余弦插值轨迹**：S 型加减速，平滑运动
-- **全部参数可配置**：通过 YAML 配置文件加载
+- PDO 模式下使用 PP 模式、RPDO1、TPDO1、TPDO2 和 SYNC 进行实时控制，默认控制频率为 200 Hz。
+- PDO 配置失败时自动回退到 SDO 模式，状态默认按 10 Hz 发布。
+- 接收线程统一处理 SDO 响应和 TPDO，SDO 请求使用队列和条件变量等待响应。
+- 电机掉电或 CAN 连接异常后尝试自动重连。
+- 订阅电源板状态，支持 LIMIT_1/LIMIT_2 限位停车和电源板通信故障停车。
+- 支持位置、速度、使能、清错和当前位置置零控制。
+- 支持位置和速度范围、加减速时间、跟随误差窗口等参数配置。
 
-## 硬件要求
+## 目录结构
 
-- CAN 接口（SocketCAN，如 `can0`）
-- DS/RS 系列驱动器（CiA 402 兼容）
-- 驱动器已配置为 CANopen 模式（`F0.1.002 = 20`）
-- 总线两端 120Ω 终端电阻
+```text
+lift_controller/
+├── config/
+│   └── lift_config.yaml          # ROS 2 参数文件，默认 CAN 接口为 can1
+├── include/lift_controller/
+│   ├── can_interface.hpp         # SocketCAN 接口
+│   ├── lift_controller.hpp       # ROS 2 节点
+│   └── motor_driver.hpp           # CANopen 电机驱动
+├── launch/
+│   └── lift_motor.launch.py      # 启动文件
+├── scripts/
+│   ├── setup_can.sh              # 配置 can1 的 CAN 接口
+│   └── read_params.py            # 通过 CANopen SDO 读取驱动器参数
+└── src/
+    ├── can_interface.cpp
+    ├── lift_controller.cpp
+    ├── main.cpp
+    └── motor_driver.cpp
+```
+
+## 硬件和软件要求
+
+- Linux 系统，并已加载 SocketCAN。
+- 一个名称为 `can1` 的 CAN 接口。可以使用 `ip link show can1` 检查。
+- DS/RS 系列驱动器，并已配置为 CANopen 模式：`F0.1.002 = 20`。
+- 驱动器节点 ID 与配置文件中的 `node_id` 一致，当前默认为 `1`。
+- CAN 总线两端安装 120 ohm 终端电阻。
+- 升降电机、驱动器和 CAN 适配器供电正常。
+- ROS 2、`rclcpp`、`std_msgs` 和 `power_board_msgs` 已安装或已在当前工作区编译。
 
 ## 编译
 
@@ -27,229 +52,513 @@ colcon build --packages-up-to lift_controller
 source install/setup.bash
 ```
 
+如果使用本仓库路径，请将 `~/workspace/ros2_ws` 替换为实际工作区路径。
+
 ## CAN 接口配置
 
-启动节点前需配置 CAN 接口（电机默认 1 Mbps）：
+升降电机默认使用 `can1`，默认波特率为 1 Mbps，采样点为 0.875。启动 ROS 2 节点前必须先配置接口。
+
+### 使用配置脚本
 
 ```bash
-# 方式一：使用自带脚本（推荐）
-sudo bash ~/workspace/ros2_ws/src/lift_controller/scripts/setup_can.sh
+# 使用默认配置: can1 @ 1000000 bps
+sudo bash src/lift_controller/scripts/setup_can.sh
 
-# 方式二：手动配置
-sudo ip link set can0 down
-sudo ip link set can0 type can bitrate 1000000 sample-point 0.875
-sudo ip link set can0 up
+# 显式指定接口和波特率
+sudo bash src/lift_controller/scripts/setup_can.sh can1 1000000
 ```
+
+脚本会执行以下操作：
+
+1. 将 `can1` 置为 down。
+2. 设置 CAN 波特率和采样点。
+3. 将 `can1` 置为 up。
+4. 设置 bus-off 自动恢复，恢复时间为 100 ms。
+5. 输出 CAN 状态和错误计数。
+
+### 手动配置
+
+```bash
+sudo ip link set can1 down
+sudo ip link set can1 type can bitrate 1000000 sample-point 0.875
+sudo ip link set can1 type can restart-ms 100
+sudo ip link set can1 up
+ip -details link show can1
+```
+
+### CAN 检查
+
+```bash
+# 检查接口是否存在及是否已启动
+ip link show can1
+
+# 监听 CAN 总线，确认驱动器有报文
+candump can1
+
+# 查看驱动器参数，脚本内默认使用 can1 和节点 ID 1
+python3 src/lift_controller/scripts/read_params.py
+```
+
+如果 `can1` 不存在，请先确认 CAN 适配器驱动和接口命名。若显示 `BUS-OFF`、`ERROR-PASSIVE` 或没有任何响应，应检查驱动器供电、CANH/CANL 接线、终端电阻、节点 ID 和波特率。
 
 ## 启动
 
 ```bash
+source install/setup.bash
 ros2 launch lift_controller lift_motor.launch.py
+```
+
+启动文件会优先读取源码目录中的 `src/lift_controller/config/lift_config.yaml`，因此修改源码配置后重新启动即可生效。若源码配置不存在，则回退到安装目录中的配置文件。
+
+也可以在启动时覆盖参数：
+
+```bash
+ros2 launch lift_controller lift_motor.launch.py \
+  can_interface:=can1 \
+  can_bitrate:=1000000 \
+  node_id:=1
+```
+
+节点启动后会在日志中打印类似以下内容：
+
+```text
+[CAN] Connected to can1
+[lift_controller] Lift Controller started (PDO mode)
 ```
 
 ## 配置参数
 
-配置文件位于 [config/lift_config.yaml](config/lift_config.yaml)：
+配置文件位于 [config/lift_config.yaml](config/lift_config.yaml)。以下是当前配置文件中的参数：
 
-| 参数 | 类型 | 默认值 | 说明 |
+| 参数 | 类型 | 当前值 | 说明 |
 |------|------|--------|------|
-| `can_interface` | string | `"can0"` | SocketCAN 接口名 |
-| `can_bitrate` | int | `1000000` | CAN 波特率（提示用，实际由 `ip link` 设置） |
+| `can_interface` | string | `"can1"` | SocketCAN 接口名，升降电机使用 `can1` |
+| `can_bitrate` | int | `1000000` | CAN 波特率，实际接口波特率由 `ip link` 或 `setup_can.sh` 设置 |
 | `node_id` | int | `1` | 驱动器 CANopen 节点 ID |
-| `mm_to_pulses` | int | `1000` | 毫米到脉冲转换系数 |
-| `max_position_mm` | int | `500` | 最大行程 (mm) |
-| `min_position_mm` | int | `0` | 最小行程 (mm) |
-| `default_speed_rpm` | int | `100` | 默认速度 (rpm) |
-| `max_speed_rpm` | int | `200` | 最大速度限幅 (rpm) |
-| `min_speed_rpm` | int | `0` | 最小速度限幅 (rpm) |
-| `accel_time_ms` | int | `500` | 加速时间 (ms) |
-| `decel_time_ms` | int | `500` | 减速时间 (ms) |
-| `status_update_hz` | int | `10` | SDO 模式状态发布频率 (Hz) |
-| `reconnect_timeout_ms` | int | `1000` | 断电重连超时 (ms) |
-| `pdo_enabled` | bool | `true` | 是否启用 PDO 模式 |
-| `pdo_frequency_hz` | int | `200` | PDO 控制循环频率 (Hz) |
+| `mm_to_pulses` | int | `1000` | 位置换算系数，脉冲数 = 毫米数 x 此参数 |
+| `max_position_mm` | int | `500` | 允许的最大目标位置，单位 mm |
+| `min_position_mm` | int | `0` | 允许的最小目标位置，单位 mm |
+| `default_speed_rpm` | int | `200` | 驱动器默认速度，单位 rpm |
+| `max_speed_rpm` | int | `1000` | 允许设置的最大速度，单位 rpm |
+| `min_speed_rpm` | int | `0` | 允许设置的最小速度，单位 rpm |
+| `accel_time_ms` | int | `1000` | 加速时间，单位 ms |
+| `decel_time_ms` | int | `1000` | 减速时间，单位 ms |
+| `following_error_pulses` | int | `200000` | 跟随误差窗口，单位脉冲；设为 `0` 表示使用驱动器内部值 |
+| `max_motor_speed_rpm` | int | `0` | 电机最大转速，设为 `0` 表示使用驱动器内部值 |
+| `status_update_hz` | int | `10` | SDO 模式下状态发布频率，单位 Hz |
+| `reconnect_timeout_ms` | int | `1000` | 掉电重连超时时间，单位 ms |
+| `pdo_enabled` | bool | `true` | 是否启用 PDO 模式；失败后仍会自动尝试 SDO 回退 |
+| `pdo_frequency_hz` | int | `200` | PDO 控制循环频率，单位 Hz |
 | `limit_safety_enabled` | bool | `true` | 是否启用电源板限位安全联锁 |
-| `power_board_status_topic` | string | `"/power_board/status"` | 电源板状态话题 |
-| `limit_1_direction` | string | `"min"` | LIMIT_1 对应的限位方向；`min` 表示禁止继续向 `min_position_mm` 方向运动，`max` 表示禁止继续向 `max_position_mm` 方向运动，`none` 表示不参与限位保护 |
-| `limit_2_direction` | string | `"max"` | LIMIT_2 对应的限位方向；现场接线相反时可与 `limit_1_direction` 对调 |
+| `power_board_status_topic` | string | `"/power_board/status"` | 电源板状态输入话题 |
+| `limit_1_direction` | string | `"min"` | LIMIT_1 禁止的运动方向，可选 `min`、`max`、`none` |
+| `limit_2_direction` | string | `"max"` | LIMIT_2 禁止的运动方向，可选 `min`、`max`、`none` |
 | `limit_stop_on_power_board_fault` | bool | `true` | 电源板通信异常或采集停滞时是否停车 |
-| `limit_status_timeout_sec` | double | `0.5` | 已收到过电源板状态后，状态超时多久触发安全停车；小于等于 0 表示禁用超时检测 |
+| `limit_status_timeout_sec` | double | `0.5` | 收到过状态后，超过此时间没有新状态则安全停车；小于等于 `0` 表示关闭超时检测 |
 
-## 话题
+`limit_1_direction` 和 `limit_2_direction` 只决定对应限位禁止的目标方向。触发限位后会立即停车，但允许发送反方向目标位置用于退出限位。电源板状态无效、通信异常或状态超时则进入安全故障，位置、带速度的位置、使能和置零等相关命令会被拒绝。
 
-### 发布的话题（节点输出）
+## ROS 2 话题
 
-#### `lift/position` — `std_msgs/Float64`
-升降当前位置，单位 mm。PDO 模式下由 TPDO 驱动 200Hz 发布；SDO 模式下按 `status_update_hz` 频率发布。
+以下示例假设节点使用默认名称 `lift_controller`，话题均使用绝对名称。ROS 2 命令中的消息类型必须使用完整写法，例如 `std_msgs/msg/Float64`。
+
+### 发布话题
+
+#### `/lift/position` - `std_msgs/msg/Float64`
+
+当前位置，单位 mm。PDO 模式下通常由 TPDO 反馈驱动发布，SDO 模式下按 `status_update_hz` 发布。
 
 ```bash
-# 查看当前位置
 ros2 topic echo /lift/position
+ros2 topic info /lift/position
 ```
 
-#### `lift/speed` — `std_msgs/Float64`
-升降当前实际速度（电机反馈），单位 rpm。PDO 模式下由 TPDO2 驱动 200Hz 发布。
+示例输出：
+
+```text
+data: 123.5
+```
+
+#### `/lift/speed` - `std_msgs/msg/Float64`
+
+电机实际反馈速度，单位 rpm。正负号表示运动方向，具体方向以现场机械安装和驱动器定义为准。
 
 ```bash
 ros2 topic echo /lift/speed
 ```
 
-#### `lift/speed_rpm` — `std_msgs/Float64`
-当前设定的运动速度（PP 模式 profile velocity），单位 rpm。通过 `lift/target_speed` 或 `lift/target_position_with_speed` 设置。
+示例输出：
+
+```text
+data: 80.0
+```
+
+#### `/lift/speed_rpm` - `std_msgs/msg/Float64`
+
+当前设定的运动速度，单位 rpm。该值由 `lift/target_speed` 或 `lift/target_position_with_speed` 更新，不等同于实际反馈速度。
 
 ```bash
 ros2 topic echo /lift/speed_rpm
 ```
 
-#### `lift/speed_percent` — `std_msgs/Float64`
-当前设定速度占最大速度（`max_speed_rpm`）的百分比，范围 0~100。
+示例输出：
+
+```text
+data: 200.0
+```
+
+#### `/lift/speed_percent` - `std_msgs/msg/Float64`
+
+当前设定速度相对于 `max_speed_rpm` 的百分比，范围通常为 0 到 100。
 
 ```bash
 ros2 topic echo /lift/speed_percent
 ```
 
-#### `lift/enabled` — `std_msgs/Bool`
-电机使能状态。`true` 表示电机已使能可运动，`false` 表示未使能。
+示例输出：
+
+```text
+data: 20.0
+```
+
+#### `/lift/enabled` - `std_msgs/msg/Bool`
+
+电机使能状态。`true` 表示驱动器已使能，`false` 表示未使能。
 
 ```bash
 ros2 topic echo /lift/enabled
 ```
 
-#### `lift/target_reached` — `std_msgs/Bool`
-是否已到达目标位置。`true` 表示已到位，`false` 表示运动中。
+示例输出：
+
+```text
+data: true
+```
+
+#### `/lift/target_reached` - `std_msgs/msg/Bool`
+
+目标位置到达状态。`true` 表示驱动器报告已到位，`false` 表示仍在运动或尚未到达目标。
 
 ```bash
 ros2 topic echo /lift/target_reached
 ```
 
-#### `lift/fault` — `std_msgs/Bool`
-是否处于故障状态。`true` 表示有故障，需调用 `lift/clear_error` 清除后才能继续运动。
+示例输出：
+
+```text
+data: false
+```
+
+#### `/lift/fault` - `std_msgs/msg/Bool`
+
+驱动器故障状态。`true` 表示当前存在故障，通常需要先发送 `lift/clear_error_cmd` 清错，再根据驱动器状态重新使能。
 
 ```bash
 ros2 topic echo /lift/fault
 ```
 
-#### `lift/error_code` — `std_msgs/Int32`
-驱动器错误码（CiA 402 对象 0x603F）。`0` 表示无错误，非零值参考驱动器手册。
+示例输出：
+
+```text
+data: false
+```
+
+#### `/lift/error_code` - `std_msgs/msg/Int32`
+
+驱动器错误码，对应 CiA 402 对象 `0x603F`。`0` 表示无错误，非零值需要结合驱动器手册解释。
 
 ```bash
 ros2 topic echo /lift/error_code
 ```
 
-#### `lift/limit_stop` — `std_msgs/Bool`
-限位安全停车状态。`true` 表示 LIMIT_1、LIMIT_2、电源板通信异常、采集停滞或状态超时触发了安全停车。限位触发后会立即请求停车；之后只拒绝继续朝触发限位方向的目标位置命令，允许反方向目标位置用于退出限位。
+示例输出：
+
+```text
+data: 0
+```
+
+#### `/lift/following_error` - `std_msgs/msg/Bool`
+
+跟随误差状态。`true` 表示实际位置与目标位置的误差超过驱动器或配置的跟随误差窗口。
+
+```bash
+ros2 topic echo /lift/following_error
+```
+
+示例输出：
+
+```text
+data: false
+```
+
+#### `/lift/limit_stop` - `std_msgs/msg/Bool`
+
+限位安全停车状态。`true` 表示 LIMIT_1、LIMIT_2、电源板通信故障、采集停滞或状态超时触发了安全停车；`false` 表示当前没有活动的安全停车状态。该话题只在状态发生变化时发布。
 
 ```bash
 ros2 topic echo /lift/limit_stop
 ```
 
-### 订阅的话题（节点输入）
+示例输出：
 
-#### `/power_board/status` — `power_board_msgs/PowerBoardStatus`
-电源板状态输入。升降节点读取其中的 `limit_1_triggered` 和 `limit_2_triggered`，任一限位触发时立即请求电机停车，并按 `limit_1_direction` / `limit_2_direction` 判断后续目标位置是否允许反向退出。
-
-#### `lift/target_position` — `std_msgs/Float64`
-设置目标位置，单位 mm。范围 `min_position_mm` ~ `max_position_mm`。
-
-```bash
-# 移动到 100mm
-ros2 topic pub --once /lift/target_position std_msgs/msg/Float64 '{data: 100.0}'
-
-# 移动到 250mm
-ros2 topic pub --once /lift/target_position std_msgs/msg/Float64 '{data: 250.0}'
+```text
+data: true
 ```
 
-#### `lift/target_speed` — `std_msgs/Float64`
-设置运动速度，单位 rpm。
+#### `/lift/version_info` - `std_msgs/msg/String`
+
+驱动器版本信息。该话题使用 transient local QoS，节点启动后才加入的订阅者也可以收到最近一次版本信息。
+
+```bash
+ros2 topic echo /lift/version_info
+ros2 topic echo /lift/version_info --qos-durability transient_local
+```
+
+示例输出：
+
+```text
+data: "DS/RS ..."
+```
+
+### 订阅话题
+
+#### `/lift/target_position` - `std_msgs/msg/Float64`
+
+设置目标位置，单位 mm。代码会检查 `min_position_mm` 到 `max_position_mm` 的范围，并根据限位安全状态拒绝不允许的运动方向。
+
+```bash
+# 移动到 100 mm
+ros2 topic pub --once /lift/target_position std_msgs/msg/Float64 "{data: 100.0}"
+
+# 移动到最大位置 500 mm
+ros2 topic pub --once /lift/target_position std_msgs/msg/Float64 "{data: 500.0}"
+```
+
+#### `/lift/target_speed` - `std_msgs/msg/Float64`
+
+设置运动速度，单位 rpm。超出 `min_speed_rpm` 到 `max_speed_rpm` 时节点会记录警告，并由电机驱动器执行限幅。
 
 ```bash
 # 设置速度为 80 rpm
-ros2 topic pub --once /lift/target_speed std_msgs/msg/Float64 '{data: 80.0}'
+ros2 topic pub --once /lift/target_speed std_msgs/msg/Float64 "{data: 80.0}"
 ```
 
-#### `lift/target_position_with_speed` — `std_msgs/Float64MultiArray`
-同时设置目标位置和运动速度。`data` 数组为 `[position_mm, speed_rpm]`，长度必须为 2。
+#### `/lift/target_position_with_speed` - `std_msgs/msg/Float64MultiArray`
+
+同时设置目标位置和速度。`data` 必须至少包含两个元素，格式为 `[position_mm, speed_rpm]`。
 
 ```bash
-# 移动到 150mm，速度 80 rpm
-ros2 topic pub --once /lift/target_position_with_speed std_msgs/msg/Float64MultiArray '{data: [150.0, 80.0]}'
+# 移动到 150 mm，速度 80 rpm
+ros2 topic pub --once /lift/target_position_with_speed \
+  std_msgs/msg/Float64MultiArray "{data: [150.0, 80.0]}"
 
-# 移动到 0mm，速度 50 rpm
-ros2 topic pub --once /lift/target_position_with_speed std_msgs/msg/Float64MultiArray '{data: [0.0, 50.0]}'
+# 移动到 0 mm，速度 50 rpm
+ros2 topic pub --once /lift/target_position_with_speed \
+  std_msgs/msg/Float64MultiArray "{data: [0.0, 50.0]}"
 ```
 
-#### `lift/enable_cmd` — `std_msgs/Bool`
-使能/失能电机。`true` 使能，`false` 失能。
+#### `/lift/enable_cmd` - `std_msgs/msg/Bool`
+
+使能或失能电机。发送 `true` 使能，发送 `false` 失能。电源板安全故障有效时，`true` 命令会被拒绝。
 
 ```bash
 # 使能电机
-ros2 topic pub --once /lift/enable_cmd std_msgs/msg/Bool '{data: true}'
+ros2 topic pub --once /lift/enable_cmd std_msgs/msg/Bool "{data: true}"
 
 # 失能电机
-ros2 topic pub --once /lift/enable_cmd std_msgs/msg/Bool '{data: false}'
+ros2 topic pub --once /lift/enable_cmd std_msgs/msg/Bool "{data: false}"
 ```
 
-#### `lift/zero_cmd` — `std_msgs/Bool`
-设置当前位置为零点（homing method 35，不回零）。发送 `true` 触发。
+#### `/lift/zero_cmd` - `std_msgs/msg/Bool`
+
+当前位置置零。发送 `true` 会调用驱动器的 homing method 35，不执行物理回零运动。电源板安全故障有效时命令会被拒绝。
 
 ```bash
-ros2 topic pub --once /lift/zero_cmd std_msgs/msg/Bool '{data: true}'
+ros2 topic pub --once /lift/zero_cmd std_msgs/msg/Bool "{data: true}"
 ```
 
-#### `lift/clear_error_cmd` — `std_msgs/Bool`
-清除驱动器故障。发送 `true` 触发。
+#### `/lift/clear_error_cmd` - `std_msgs/msg/Bool`
+
+清除驱动器故障。发送 `true` 触发一次清错操作，发送 `false` 不执行动作。
 
 ```bash
-ros2 topic pub --once /lift/clear_error_cmd std_msgs/msg/Bool '{data: true}'
+ros2 topic pub --once /lift/clear_error_cmd std_msgs/msg/Bool "{data: true}"
 ```
 
-## 完整使用示例
+#### `/power_board/status` - `power_board_msgs/msg/PowerBoardStatus`
+
+电源板状态输入，默认由 `power_board_driver` 发布。升降节点主要使用以下字段：
+
+| 字段 | 作用 |
+|------|------|
+| `communication_ok` | 电源板通信是否正常 |
+| `last_error` | 通信异常时的错误信息 |
+| `limit_1_valid` | LIMIT_1 输入是否有效 |
+| `limit_2_valid` | LIMIT_2 输入是否有效 |
+| `limit_1_triggered` | LIMIT_1 是否触发 |
+| `limit_2_triggered` | LIMIT_2 是否触发 |
+| `acquisition_stalled` | 电源板采集是否停滞 |
+
+查看电源板状态：
 
 ```bash
-# 1. 配置 CAN 接口
-sudo bash ~/workspace/ros2_ws/src/lift_controller/scripts/setup_can.sh
+ros2 topic echo /power_board/status
+ros2 topic info /power_board/status
+```
 
-# 2. 启动节点
+开发或联调时可以手动发布一条正常状态。未填写的消息字段使用默认值：
+
+```bash
+ros2 topic pub --once /power_board/status \
+  power_board_msgs/msg/PowerBoardStatus \
+  "{communication_ok: true, limit_1_valid: true, limit_2_valid: true, limit_1_triggered: false, limit_2_triggered: false, acquisition_stalled: false}"
+```
+
+模拟 LIMIT_1 触发：
+
+```bash
+ros2 topic pub --once /power_board/status \
+  power_board_msgs/msg/PowerBoardStatus \
+  "{communication_ok: true, limit_1_valid: true, limit_2_valid: true, limit_1_triggered: true, limit_2_triggered: false, acquisition_stalled: false}"
+```
+
+模拟电源板通信故障：
+
+```bash
+ros2 topic pub --once /power_board/status \
+  power_board_msgs/msg/PowerBoardStatus \
+  "{communication_ok: false, last_error: 'test communication fault', limit_1_valid: true, limit_2_valid: true, acquisition_stalled: false}"
+```
+
+以上手动发布命令只用于测试，不建议在实际运行时替代 `power_board_driver`。
+
+## 完整运行示例
+
+建议按以下顺序在不同终端执行：
+
+```bash
+# 终端 1: 编译并加载工作区
+cd ~/workspace/ros2_ws
+colcon build --packages-up-to lift_controller
+source install/setup.bash
+
+# 终端 2: 配置升降电机 CAN，默认是 can1 @ 1 Mbps
+sudo bash src/lift_controller/scripts/setup_can.sh
+
+# 终端 3: 启动升降节点
+source install/setup.bash
 ros2 launch lift_controller lift_motor.launch.py
 
-# 3. 在另一个终端查看状态
+# 终端 4: 观察状态
+source install/setup.bash
 ros2 topic echo /lift/position
 ros2 topic echo /lift/enabled
+ros2 topic echo /lift/fault
+ros2 topic echo /lift/limit_stop
 
-# 4. 控制升降运动
-ros2 topic pub --once /lift/target_position std_msgs/msg/Float64 '{data: 100.0}'
+# 终端 5: 发送控制命令
+ros2 topic pub --once /lift/enable_cmd std_msgs/msg/Bool "{data: true}"
+ros2 topic pub --once /lift/target_position_with_speed \
+  std_msgs/msg/Float64MultiArray "{data: [100.0, 80.0]}"
+```
 
-# 5. 查看所有话题
-ros2 topic list
+停止运动或停止发送目标位置后，可以发送失能命令：
+
+```bash
+ros2 topic pub --once /lift/enable_cmd std_msgs/msg/Bool "{data: false}"
 ```
 
 ## 工作模式
 
-### PDO 模式（默认，`pdo_enabled: true`）
-- PP 模式（Profile Position），驱动器内部处理轨迹
-- RPDO1：ControlWord + TargetPosition，200Hz 周期发送 + SYNC
-- TPDO1：StatusWord + PositionActual + ErrorCode，事件驱动反馈
-- TPDO2：VelocityActual，同步反馈（TPDO1 已满 8 字节，速度单独走 TPDO2）
-- 控制延迟 < 0.1ms
+### PDO 模式
 
-### SDO 模式（回退）
-- PDO 配置失败时自动启用
-- 状态按 `status_update_hz` 频率通过 SDO 轮询
-- 控制延迟 ~5-10ms
+当 `pdo_enabled: true` 且驱动器支持所需 PDO 配置时，节点会进入 PDO 模式：
+
+- 使用 PP 模式进行位置控制。
+- RPDO1 发送 ControlWord 和 TargetPosition。
+- TPDO1 返回 StatusWord、PositionActual 和 ErrorCode。
+- TPDO2 返回 VelocityActual。
+- 默认控制循环频率为 200 Hz。
+
+### SDO 回退模式
+
+当 PDO 配置失败时，节点会自动回退到 SDO 模式：
+
+- 通过 SDO 读写控制字、目标位置和状态。
+- 状态按 `status_update_hz` 发布，默认 10 Hz。
+- 控制延迟高于 PDO 模式，适合调试和兼容性验证。
+
+## 常见问题
+
+### 节点提示找不到 `can1`
+
+```bash
+ip link show can1
+```
+
+如果没有输出，说明系统没有创建该接口。请检查 CAN 适配器驱动、设备连接和接口命名。
+
+### CAN 状态为 `BUS-OFF` 或没有驱动器响应
+
+依次检查：
+
+1. 驱动器和 CAN 适配器是否供电。
+2. CANH、CANL 是否正确连接。
+3. 总线两端是否各有 120 ohm 终端电阻。
+4. `can1` 波特率是否为 1 Mbps。
+5. `node_id` 是否与驱动器节点 ID 一致。
+6. 驱动器是否设置为 CANopen 模式。
+
+可以使用以下命令观察总线：
+
+```bash
+candump can1
+ip -details link show can1
+```
+
+### 触发限位后不能继续运动
+
+这是限位安全联锁的预期行为。确认 `/lift/limit_stop` 和 `/power_board/status`：
+
+```bash
+ros2 topic echo /lift/limit_stop
+ros2 topic echo /power_board/status
+```
+
+触发限位时，继续朝限位方向的目标位置会被拒绝；发送反方向目标位置可以退出限位。如果电源板通信异常、输入无效或状态超时，需要先恢复电源板状态。
+
+### 驱动器有故障
+
+先查看故障状态和错误码：
+
+```bash
+ros2 topic echo /lift/fault
+ros2 topic echo /lift/error_code
+```
+
+确认机械和电气条件正常后清除故障：
+
+```bash
+ros2 topic pub --once /lift/clear_error_cmd std_msgs/msg/Bool "{data: true}"
+ros2 topic pub --once /lift/enable_cmd std_msgs/msg/Bool "{data: true}"
+```
 
 ## 节点架构
 
-```
-CanInterface (SocketCAN)
-    ├── 接收线程: SDO 响应入队, TPDO 走回调
-    └── sendAndWait: 队列 + condition_variable 等待 SDO 响应
+```text
+CanInterface (SocketCAN on can1)
+    ├── 接收线程: SDO 响应入队，TPDO 通过回调分发
+    └── sendAndWait: 队列和 condition_variable 等待 SDO 响应
 
 MotorDriver
-    ├── init: 读 F0.1.002 → 配置 PP → 配置 PDO → 使能
-    ├── controlLoop (PDO): 200Hz 发送 RPDO + SYNC
-    └── handleTPDO: 解析 TPDO1(StatusWord/Position/ErrorCode) + TPDO2(Velocity) → statusCallback
+    ├── init: 读取驱动器模式，配置 PP 和 PDO，执行使能
+    ├── controlLoop (PDO): 发送 RPDO 和 SYNC
+    └── handleTPDO: 解析状态、位置、错误码和速度
 
-LiftController (ROS2 Node)
-    ├── 发布: position/speed/enabled/target_reached/fault/error_code
-    └── 订阅: target_position/target_speed/target_position_with_speed/enable_cmd/zero_cmd/clear_error_cmd
+LiftController (ROS 2 Node)
+    ├── 发布: position/speed/speed_rpm/speed_percent/enabled
+    │          target_reached/fault/error_code/following_error
+    │          limit_stop/version_info
+    └── 订阅: target_position/target_speed/target_position_with_speed
+               enable_cmd/zero_cmd/clear_error_cmd/power_board/status
 ```

@@ -1,6 +1,6 @@
 lift_controller:
   ros__parameters:
-    can_interface: "can0"
+    can_interface: "can1"
     can_bitrate: 1000000
     node_id: 1
     mm_to_pulses: 1000

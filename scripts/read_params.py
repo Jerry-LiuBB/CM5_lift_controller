@@ -5,7 +5,7 @@ import socket
 import struct
 import sys
 
-CAN_IFACE = "can0"
+CAN_IFACE = "can1"
 NODE_ID   = 1
 
 # F0.y.zzz → 0x2000 + 0x100*y + z
