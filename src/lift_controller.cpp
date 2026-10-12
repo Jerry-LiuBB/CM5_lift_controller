@@ -53,6 +53,7 @@ LiftController::LiftController() : Node("lift_controller") {
     fault_pub_ = this->create_publisher<std_msgs::msg::Bool>("lift/fault", 10);
     following_error_pub_ = this->create_publisher<std_msgs::msg::Bool>("lift/following_error", 10);
     limit_stop_pub_ = this->create_publisher<std_msgs::msg::Bool>("lift/limit_stop", 10);
+    digital_inputs_pub_ = this->create_publisher<std_msgs::msg::Int32>("lift/drive_digital_inputs", 10);
 
     // 版本信息使用 latched QoS — 后订阅的节点也能立即收到
     rclcpp::QoS latched_qos(rclcpp::KeepLast(1));
@@ -83,12 +84,6 @@ LiftController::LiftController() : Node("lift_controller") {
     clear_error_sub_ = this->create_subscription<std_msgs::msg::Bool>(
         "lift/clear_error_cmd", 10,
         std::bind(&LiftController::clearErrorCallback, this, std::placeholders::_1));
-
-    if (limit_safety_enabled_) {
-        power_board_status_sub_ = this->create_subscription<power_board_msgs::msg::PowerBoardStatus>(
-            power_board_status_topic_, 10,
-            std::bind(&LiftController::powerBoardStatusCallback, this, std::placeholders::_1));
-    }
 
     // 初始化电机驱动器(init 内会启动 PDO 控制循环,TPDO 回调将触发 publish)
     motor_driver_ = std::make_unique<MotorDriver>(*can_interface_);
@@ -165,10 +160,11 @@ void LiftController::loadConfig() {
     this->declare_parameter("pdo_enabled", true);
     this->declare_parameter("pdo_frequency_hz", 200);
     this->declare_parameter("limit_safety_enabled", true);
-    this->declare_parameter("power_board_status_topic", "/power_board/status");
     this->declare_parameter("limit_1_direction", "min");
     this->declare_parameter("limit_2_direction", "max");
-    this->declare_parameter("limit_stop_on_power_board_fault", true);
+    this->declare_parameter("limit_1_input_mask", 1);
+    this->declare_parameter("limit_2_input_mask", 2);
+    this->declare_parameter("limit_inputs_active_high", true);
     this->declare_parameter("limit_status_timeout_sec", 0.5);
 
     this->get_parameter("can_interface", config_.can_interface);
@@ -189,11 +185,16 @@ void LiftController::loadConfig() {
     this->get_parameter("pdo_enabled", config_.pdo_enabled);
     this->get_parameter("pdo_frequency_hz", config_.pdo_frequency_hz);
     this->get_parameter("limit_safety_enabled", limit_safety_enabled_);
-    this->get_parameter("power_board_status_topic", power_board_status_topic_);
     this->get_parameter("limit_1_direction", limit_1_direction_);
     this->get_parameter("limit_2_direction", limit_2_direction_);
-    this->get_parameter("limit_stop_on_power_board_fault", limit_stop_on_power_board_fault_);
+    int limit_1_mask = static_cast<int>(limit_1_input_mask_);
+    int limit_2_mask = static_cast<int>(limit_2_input_mask_);
+    this->get_parameter("limit_1_input_mask", limit_1_mask);
+    this->get_parameter("limit_2_input_mask", limit_2_mask);
+    this->get_parameter("limit_inputs_active_high", limit_inputs_active_high_);
     this->get_parameter("limit_status_timeout_sec", limit_status_timeout_sec_);
+    limit_1_input_mask_ = limit_1_mask > 0 ? static_cast<uint32_t>(limit_1_mask) : 0;
+    limit_2_input_mask_ = limit_2_mask > 0 ? static_cast<uint32_t>(limit_2_mask) : 0;
 
     limit_1_block_direction_ =
         parseLimitDirection(limit_1_direction_, "limit_1_direction", this->get_logger());
@@ -206,6 +207,7 @@ void LiftController::statusCallback(const MotorStatus& status) {
         std::lock_guard<std::mutex> lock(status_mutex_);
         current_status_ = status;
     }
+    updateDriveLimitState(status);
     // PDO 模式:TPDO 驱动发布(200Hz),直接调用 publishState
     // SDO 模式:由 state_timer 定期发布
     if (motor_driver_ && motor_driver_->isPDOMode()) {
@@ -259,18 +261,61 @@ void LiftController::publishState() {
     auto follow_err_msg = std_msgs::msg::Bool();
     follow_err_msg.data = current_status_.following_error;
     following_error_pub_->publish(follow_err_msg);
+
+    auto digital_inputs_msg = std_msgs::msg::Int32();
+    digital_inputs_msg.data = static_cast<int32_t>(current_status_.digital_inputs);
+    digital_inputs_pub_->publish(digital_inputs_msg);
 }
 
-void LiftController::powerBoardStatusCallback(
-    const power_board_msgs::msg::PowerBoardStatus::SharedPtr msg) {
+void LiftController::updateDriveLimitState(const MotorStatus& status) {
     if (!limit_safety_enabled_) return;
 
     const bool limit_1_enabled = limit_1_block_direction_ != 0;
     const bool limit_2_enabled = limit_2_block_direction_ != 0;
-    const bool limit_1_invalid = limit_1_enabled && !msg->limit_1_valid;
-    const bool limit_2_invalid = limit_2_enabled && !msg->limit_2_valid;
-    const bool limit_1_triggered = msg->limit_1_triggered && limit_1_enabled;
-    const bool limit_2_triggered = msg->limit_2_triggered && limit_2_enabled;
+    const bool limit_1_configured = limit_1_input_mask_ != 0;
+    const bool limit_2_configured = limit_2_input_mask_ != 0;
+    const bool limit_1_invalid = limit_1_enabled && !limit_1_configured;
+    const bool limit_2_invalid = limit_2_enabled && !limit_2_configured;
+
+    if (!status.digital_inputs_valid) {
+        bool active = limit_1_invalid || limit_2_invalid;
+        std::string reason;
+        if (limit_1_invalid && limit_2_invalid) {
+            reason = "LIMIT_1 and LIMIT_2 inputs invalid";
+        } else if (limit_1_invalid) {
+            reason = "LIMIT_1 input invalid";
+        } else if (limit_2_invalid) {
+            reason = "LIMIT_2 input invalid";
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(limit_mutex_);
+            if (!have_drive_limit_status_) {
+                have_drive_limit_status_ = true;
+                last_drive_limit_status_time_ = this->now();
+            }
+            limit_1_active_ = false;
+            limit_2_active_ = false;
+            limit_safety_fault_active_ = active;
+        }
+
+        if (active) {
+            setLimitStopState(true, reason);
+        }
+        return;
+    }
+
+    const auto inputActive = [this, &status](uint32_t mask) {
+        const bool matched = (status.digital_inputs & mask) != 0;
+        return limit_inputs_active_high_ ? matched : !matched;
+    };
+
+    const bool limit_1_triggered =
+        status.digital_inputs_valid && limit_1_enabled && limit_1_configured &&
+        inputActive(limit_1_input_mask_);
+    const bool limit_2_triggered =
+        status.digital_inputs_valid && limit_2_enabled && limit_2_configured &&
+        inputActive(limit_2_input_mask_);
 
     bool active = limit_1_triggered || limit_2_triggered;
     std::string reason;
@@ -291,26 +336,15 @@ void LiftController::powerBoardStatusCallback(
         } else {
             reason = "LIMIT_2 input invalid";
         }
-    } else if (limit_stop_on_power_board_fault_) {
-        if (!msg->communication_ok) {
-            active = true;
-            reason = "power board communication fault: " + msg->last_error;
-        } else if (msg->acquisition_stalled) {
-            active = true;
-            reason = "power board acquisition stalled";
-        }
     }
 
     {
         std::lock_guard<std::mutex> lock(limit_mutex_);
-        have_power_board_status_ = true;
-        last_power_board_status_time_ = this->now();
+        have_drive_limit_status_ = true;
+        last_drive_limit_status_time_ = this->now();
         limit_1_active_ = limit_1_triggered;
         limit_2_active_ = limit_2_triggered;
-        limit_safety_fault_active_ =
-            limit_1_invalid || limit_2_invalid ||
-            (limit_stop_on_power_board_fault_ &&
-             (!msg->communication_ok || msg->acquisition_stalled));
+        limit_safety_fault_active_ = limit_1_invalid || limit_2_invalid;
     }
 
     setLimitStopState(active, reason);
@@ -411,8 +445,8 @@ void LiftController::checkLimitStatusTimeout() {
     bool timed_out = false;
     {
         std::lock_guard<std::mutex> lock(limit_mutex_);
-        if (have_power_board_status_) {
-            timed_out = (this->now() - last_power_board_status_time_).seconds() >
+        if (have_drive_limit_status_) {
+            timed_out = (this->now() - last_drive_limit_status_time_).seconds() >
                         limit_status_timeout_sec_;
         }
     }
@@ -422,7 +456,7 @@ void LiftController::checkLimitStatusTimeout() {
             std::lock_guard<std::mutex> lock(limit_mutex_);
             limit_safety_fault_active_ = true;
         }
-        setLimitStopState(true, "power board status timeout");
+        setLimitStopState(true, "drive digital input status timeout");
     }
 }
 

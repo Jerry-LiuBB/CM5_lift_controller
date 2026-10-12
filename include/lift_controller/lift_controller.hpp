@@ -7,7 +7,6 @@
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/string.hpp>
-#include <power_board_msgs/msg/power_board_status.hpp>
 #include "lift_controller/motor_driver.hpp"
 
 namespace lift_controller {
@@ -30,7 +29,7 @@ private:
     void enableCallback(const std_msgs::msg::Bool::SharedPtr msg);
     void setZeroCallback(const std_msgs::msg::Bool::SharedPtr msg);
     void clearErrorCallback(const std_msgs::msg::Bool::SharedPtr msg);
-    void powerBoardStatusCallback(const power_board_msgs::msg::PowerBoardStatus::SharedPtr msg);
+    void updateDriveLimitState(const MotorStatus& status);
     bool rejectPositionIfBlockedByLimit(const char* command_name, int target_pos_mm);
     bool rejectCommandIfSafetyFault(const char* command_name);
     void setLimitStopState(bool active, const std::string& reason);
@@ -52,6 +51,7 @@ private:
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr following_error_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr version_pub_;  // 驱动器版本信息(latched)
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr limit_stop_pub_;
+    rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr digital_inputs_pub_;
 
     // Subscribers
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr target_pos_sub_;
@@ -60,7 +60,6 @@ private:
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr enable_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr zero_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr clear_error_sub_;
-    rclcpp::Subscription<power_board_msgs::msg::PowerBoardStatus>::SharedPtr power_board_status_sub_;
 
     rclcpp::TimerBase::SharedPtr state_timer_;
 
@@ -68,19 +67,20 @@ private:
     std::mutex status_mutex_;
     mutable std::mutex limit_mutex_;
     bool limit_safety_enabled_ = true;
-    bool limit_stop_on_power_board_fault_ = true;
     double limit_status_timeout_sec_ = 0.5;
-    std::string power_board_status_topic_ = "/power_board/status";
     std::string limit_1_direction_ = "min";
     std::string limit_2_direction_ = "max";
     int limit_1_block_direction_ = -1;
     int limit_2_block_direction_ = 1;
+    uint32_t limit_1_input_mask_ = 0x1;
+    uint32_t limit_2_input_mask_ = 0x2;
+    bool limit_inputs_active_high_ = true;
     bool limit_stop_active_ = false;
     bool limit_safety_fault_active_ = false;
-    bool have_power_board_status_ = false;
+    bool have_drive_limit_status_ = false;
     bool limit_1_active_ = false;
     bool limit_2_active_ = false;
-    rclcpp::Time last_power_board_status_time_;
+    rclcpp::Time last_drive_limit_status_time_;
     std::string limit_stop_reason_;
 
     struct Config {

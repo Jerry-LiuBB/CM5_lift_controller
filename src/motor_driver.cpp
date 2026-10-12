@@ -18,6 +18,7 @@ constexpr uint16_t OD_TARGET_POSITION = 0x607A;
 constexpr uint16_t OD_PROFILE_VELOCITY = 0x6081;
 constexpr uint16_t OD_POSITION_ACTUAL = 0x6063;
 constexpr uint16_t OD_VELOCITY_ACTUAL = 0x606C;
+constexpr uint16_t OD_DIGITAL_INPUTS  = 0x60FD;
 constexpr uint16_t OD_HOME_OFFSET     = 0x607C;
 constexpr uint16_t OD_HOMING_METHOD   = 0x6098;
 constexpr uint16_t OD_POSITION_LIMIT  = 0x607D;  // 软件位置限位
@@ -301,8 +302,8 @@ bool MotorDriver::configurePDO() {
     if (!writeSDO(OD_TPDO1_MAP, 0, 3, 1)) return false;  // 启用(3个对象)
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
-    // === TPDO2: VelocityActual(32) ===
-    // TPDO1 已满 8 字节,速度实际值单独走 TPDO2
+    // === TPDO2: VelocityActual(32) + DigitalInputs(32) ===
+    // TPDO1 已满 8 字节,速度实际值和驱动器数字输入单独走 TPDO2
     if (!writeSDO(OD_TPDO2_COMM, 2, 1, 1)) return false;  // 传输类型=同步
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
@@ -310,7 +311,9 @@ bool MotorDriver::configurePDO() {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     if (!writeSDO(OD_TPDO2_MAP, 1, 0x606C0020, 4)) return false;  // VelocityActual 32bit
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    if (!writeSDO(OD_TPDO2_MAP, 0, 1, 1)) return false;  // 启用(1个对象)
+    if (!writeSDO(OD_TPDO2_MAP, 2, 0x60FD0020, 4)) return false;  // DigitalInputs 32bit
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!writeSDO(OD_TPDO2_MAP, 0, 2, 1)) return false;  // 启用(2个对象)
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     // 进入 Operational
@@ -539,7 +542,7 @@ void MotorDriver::handleTPDO(const CanFrame& frame) {
         return;
     }
 
-    // TPDO2: VelocityActual(32)
+    // TPDO2: VelocityActual(32) + DigitalInputs(32)
     if (frame.id == static_cast<uint32_t>(0x280 + config_.node_id)) {
         if (frame.dlc < 4) return;
         int32_t velocity_actual;
@@ -547,6 +550,10 @@ void MotorDriver::handleTPDO(const CanFrame& frame) {
         {
             std::lock_guard<std::mutex> lock(status_mutex_);
             status_.speed_01rpm = velocity_actual;
+            if (frame.dlc >= 8) {
+                std::memcpy(&status_.digital_inputs, &frame.data[4], 4);
+                status_.digital_inputs_valid = true;
+            }
         }
         // 不触发 callback: TPDO1 会以 200Hz 触发 publishState,
         // speed 在下一个 TPDO1 周期即可发布,避免重复发布
@@ -937,9 +944,18 @@ bool MotorDriver::updateStatus() {
         failures++;
     }
 
-    if (failures >= 3) {
+    uint32_t digital_inputs;
+    if (readSDO(OD_DIGITAL_INPUTS, 0, digital_inputs)) {
+        new_status.digital_inputs = digital_inputs;
+        new_status.digital_inputs_valid = true;
+    } else {
+        new_status.digital_inputs_valid = false;
+        failures++;
+    }
+
+    if (failures >= 4) {
         std::cerr << "[Motor] Drive not responding (" << failures
-                  << "/4 SDO reads failed)" << std::endl;
+                  << "/5 SDO reads failed)" << std::endl;
         connected_ = false;
     }
 
