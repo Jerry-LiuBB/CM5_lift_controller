@@ -51,7 +51,9 @@ private:
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr following_error_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr version_pub_;  // 驱动器版本信息(latched)
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr limit_stop_pub_;
-    rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr digital_inputs_pub_;
+    rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr drive_limit_status_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr limit_1_triggered_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr limit_2_triggered_pub_;
 
     // Subscribers
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr target_pos_sub_;
@@ -68,10 +70,10 @@ private:
     mutable std::mutex limit_mutex_;
     bool limit_safety_enabled_ = true;
     double limit_status_timeout_sec_ = 0.5;
-    std::string limit_1_direction_ = "min";
-    std::string limit_2_direction_ = "max";
-    int limit_1_block_direction_ = -1;
-    int limit_2_block_direction_ = 1;
+    std::string limit_1_direction_ = "max";
+    std::string limit_2_direction_ = "min";
+    int limit_1_block_direction_ = 1;
+    int limit_2_block_direction_ = -1;
     uint32_t limit_1_input_mask_ = 0x1;
     uint32_t limit_2_input_mask_ = 0x2;
     bool limit_inputs_active_high_ = true;

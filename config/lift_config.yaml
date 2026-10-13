@@ -18,9 +18,9 @@ lift_controller:
     pdo_enabled: true
     pdo_frequency_hz: 200
     limit_safety_enabled: true
-    limit_1_direction: "min"       # LIMIT_1 触发后禁止继续向 min_position_mm 方向运动
-    limit_2_direction: "max"       # LIMIT_2 触发后禁止继续向 max_position_mm 方向运动
-    limit_1_input_mask: 1          # 驱动器 0x60FD 中 LIMIT_1 对应 bit mask,需现场实测确认
-    limit_2_input_mask: 2          # 驱动器 0x60FD 中 LIMIT_2 对应 bit mask,需现场实测确认
+    limit_1_direction: "max"       # SIN1/上限触发后禁止继续向 max_position_mm 方向运动
+    limit_2_direction: "min"       # SIN2/下限触发后禁止继续向 min_position_mm 方向运动
+    limit_1_input_mask: 1          # 驱动器 D17/0x5011 中 SIN1 对应 bit mask
+    limit_2_input_mask: 2          # 驱动器 D17/0x5011 中 SIN2 对应 bit mask
     limit_inputs_active_high: true # true: mask 位为 1 表示触发; false: mask 位为 0 表示触发
     limit_status_timeout_sec: 0.5

@@ -8,7 +8,7 @@
 - PDO 配置失败时自动回退到 SDO 模式，状态默认按 10 Hz 发布。
 - 接收线程统一处理 SDO 响应和 TPDO，SDO 请求使用队列和条件变量等待响应。
 - 电机掉电或 CAN 连接异常后尝试自动重连。
-- 通过驱动器 `0x60FD` 数字输入读取 LIMIT_1/LIMIT_2，支持限位停车和反方向退出。
+- 通过驱动器 D 参数 `0x5011` 读取 SIN1/SIN2 限位状态，支持限位停车和反方向退出。
 - 支持位置、速度、使能、清错和当前位置置零控制。
 - 支持位置和速度范围、加减速时间、跟随误差窗口等参数配置。
 
@@ -149,15 +149,15 @@ ros2 launch lift_controller lift_motor.launch.py \
 | `reconnect_timeout_ms` | int | `1000` | 掉电重连超时时间，单位 ms |
 | `pdo_enabled` | bool | `true` | 是否启用 PDO 模式；失败后仍会自动尝试 SDO 回退 |
 | `pdo_frequency_hz` | int | `200` | PDO 控制循环频率，单位 Hz |
-| `limit_safety_enabled` | bool | `true` | 是否启用驱动器数字输入限位安全联锁 |
-| `limit_1_direction` | string | `"min"` | LIMIT_1 禁止的运动方向，可选 `min`、`max`、`none` |
-| `limit_2_direction` | string | `"max"` | LIMIT_2 禁止的运动方向，可选 `min`、`max`、`none` |
-| `limit_1_input_mask` | int | `1` | 驱动器 `0x60FD` 中 LIMIT_1 对应 bit mask，需现场实测确认 |
-| `limit_2_input_mask` | int | `2` | 驱动器 `0x60FD` 中 LIMIT_2 对应 bit mask，需现场实测确认 |
+| `limit_safety_enabled` | bool | `true` | 是否启用驱动器 SIN 限位安全联锁 |
+| `limit_1_direction` | string | `"max"` | SIN1/上限禁止的运动方向，可选 `min`、`max`、`none` |
+| `limit_2_direction` | string | `"min"` | SIN2/下限禁止的运动方向，可选 `min`、`max`、`none` |
+| `limit_1_input_mask` | int | `1` | 驱动器 `0x5011` 中 SIN1 对应 bit mask |
+| `limit_2_input_mask` | int | `2` | 驱动器 `0x5011` 中 SIN2 对应 bit mask |
 | `limit_inputs_active_high` | bool | `true` | `true` 表示 mask 位为 1 时触发，`false` 表示 mask 位为 0 时触发 |
-| `limit_status_timeout_sec` | double | `0.5` | 收到过驱动器数字输入后，超过此时间没有新状态则安全停车；小于等于 `0` 表示关闭超时检测 |
+| `limit_status_timeout_sec` | double | `0.5` | 收到过驱动器 `0x5011` 状态后，超过此时间没有新状态则安全停车；小于等于 `0` 表示关闭超时检测 |
 
-`limit_1_direction` 和 `limit_2_direction` 只决定对应限位禁止的目标方向。触发限位后会立即停车，但允许发送反方向目标位置用于退出限位。驱动器数字输入状态不可用、mask 配置无效或状态超时会进入安全故障，位置、带速度的位置、使能和置零等相关命令会被拒绝。
+`limit_1_direction` 和 `limit_2_direction` 只决定对应限位禁止的目标方向。触发限位后会立即停车，但允许发送反方向目标位置用于退出限位。驱动器 `0x5011` 状态不可用、mask 配置无效或状态超时会进入安全故障，位置、带速度的位置、使能和置零等相关命令会被拒绝。
 
 ## ROS 2 话题
 
@@ -294,7 +294,7 @@ data: false
 
 #### `/lift/limit_stop` - `std_msgs/msg/Bool`
 
-限位安全停车状态。`true` 表示 LIMIT_1、LIMIT_2、驱动器数字输入不可用、mask 配置无效或状态超时触发了安全停车；`false` 表示当前没有活动的安全停车状态。该话题只在状态发生变化时发布。
+限位安全停车状态。`true` 表示 SIN1、SIN2、驱动器 `0x5011` 状态不可用、mask 配置无效或状态超时触发了安全停车；`false` 表示当前没有活动的安全停车状态。该话题只在状态发生变化时发布。
 
 ```bash
 ros2 topic echo /lift/limit_stop
@@ -360,7 +360,7 @@ ros2 topic pub --once /lift/target_position_with_speed \
 
 #### `/lift/enable_cmd` - `std_msgs/msg/Bool`
 
-使能或失能电机。发送 `true` 使能，发送 `false` 失能。驱动器数字输入安全故障有效时，`true` 命令会被拒绝。
+使能或失能电机。发送 `true` 使能，发送 `false` 失能。驱动器限位状态安全故障有效时，`true` 命令会被拒绝。
 
 ```bash
 # 使能电机
@@ -372,7 +372,7 @@ ros2 topic pub --once /lift/enable_cmd std_msgs/msg/Bool "{data: false}"
 
 #### `/lift/zero_cmd` - `std_msgs/msg/Bool`
 
-当前位置置零。发送 `true` 会调用驱动器的 homing method 35，不执行物理回零运动。驱动器数字输入安全故障有效时命令会被拒绝。
+当前位置置零。发送 `true` 会调用驱动器的 homing method 35，不执行物理回零运动。驱动器限位状态安全故障有效时命令会被拒绝。
 
 ```bash
 ros2 topic pub --once /lift/zero_cmd std_msgs/msg/Bool "{data: true}"
@@ -386,28 +386,37 @@ ros2 topic pub --once /lift/zero_cmd std_msgs/msg/Bool "{data: true}"
 ros2 topic pub --once /lift/clear_error_cmd std_msgs/msg/Bool "{data: true}"
 ```
 
-#### `/lift/drive_digital_inputs` - `std_msgs/msg/Int32`
+#### `/lift/drive_limit_status` - `std_msgs/msg/Int32`
 
-驱动器数字输入状态，来自 CANopen 对象字典 `0x60FD Digital input`。PDO 模式下由 TPDO2 上报，SDO 回退模式下由状态轮询读取。
+驱动器限位状态，来自 D 参数 `0x5011`。PDO 模式下由 TPDO2 上报，SDO 回退模式下由状态轮询读取。
 
-查看驱动器数字输入：
-
-```bash
-ros2 topic echo /lift/drive_digital_inputs
-```
-
-现场调试 LIMIT_1/LIMIT_2 的 bit mask 时，建议分别记录三种状态：
+查看驱动器限位状态：
 
 ```bash
-ros2 topic echo /lift/drive_digital_inputs --once
-# 不触发限位、只触发 LIMIT_1、只触发 LIMIT_2 时各读一次
+ros2 topic echo /lift/drive_limit_status
 ```
 
-用三次读数的变化位确定 `limit_1_input_mask` 和 `limit_2_input_mask`。例如正常为 `0`，触发 LIMIT_1 后为 `1`，触发 LIMIT_2 后为 `2`，则保持默认：
+现场调试 SIN1/SIN2 的 bit mask 时，建议分别记录三种状态：
+
+```bash
+ros2 topic echo /lift/drive_limit_status --once
+# 不触发限位、只触发 SIN1、只触发 SIN2 时各读一次
+```
+
+用三次读数的变化位确定 `limit_1_input_mask` 和 `limit_2_input_mask`。例如正常为 `0`，触发 SIN1 后为 `1`，触发 SIN2 后为 `2`，则保持默认：
 
 ```yaml
 limit_1_input_mask: 1
 limit_2_input_mask: 2
+```
+
+#### `/lift/limit_1_triggered` 和 `/lift/limit_2_triggered` - `std_msgs/msg/Bool`
+
+解码后的 SIN1/SIN2 限位触发状态。默认配置下 SIN1 为上限，SIN2 为下限。
+
+```bash
+ros2 topic echo /lift/limit_1_triggered
+ros2 topic echo /lift/limit_2_triggered
 ```
 
 ## 完整运行示例
@@ -496,14 +505,14 @@ ip -details link show can1
 
 ### 触发限位后不能继续运动
 
-这是限位安全联锁的预期行为。确认 `/lift/limit_stop` 和 `/lift/drive_digital_inputs`：
+这是限位安全联锁的预期行为。确认 `/lift/limit_stop` 和 `/lift/drive_limit_status`：
 
 ```bash
 ros2 topic echo /lift/limit_stop
-ros2 topic echo /lift/drive_digital_inputs
+ros2 topic echo /lift/drive_limit_status
 ```
 
-触发限位时，继续朝限位方向的目标位置会被拒绝；发送反方向目标位置可以退出限位。如果驱动器数字输入不可用、mask 配置无效或状态超时，需要先恢复 CAN 通信和驱动器输入状态。
+触发限位时，继续朝限位方向的目标位置会被拒绝；发送反方向目标位置可以退出限位。如果驱动器 `0x5011` 状态不可用、mask 配置无效或状态超时，需要先恢复 CAN 通信和驱动器限位状态。
 
 ### 驱动器有故障
 
@@ -531,12 +540,12 @@ CanInterface (SocketCAN on can1)
 MotorDriver
     ├── init: 读取驱动器模式，配置 PP 和 PDO，执行使能
     ├── controlLoop (PDO): 发送 RPDO 和 SYNC
-    └── handleTPDO: 解析状态、位置、错误码、速度和数字输入
+    └── handleTPDO: 解析状态、位置、错误码、速度和限位状态
 
 LiftController (ROS 2 Node)
     ├── 发布: position/speed/speed_rpm/speed_percent/enabled
     │          target_reached/fault/error_code/following_error
-    │          limit_stop/version_info/drive_digital_inputs
+    │          limit_stop/version_info/drive_limit_status
     └── 订阅: target_position/target_speed/target_position_with_speed
                enable_cmd/zero_cmd/clear_error_cmd
 ```

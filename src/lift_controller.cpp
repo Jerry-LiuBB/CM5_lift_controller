@@ -53,7 +53,9 @@ LiftController::LiftController() : Node("lift_controller") {
     fault_pub_ = this->create_publisher<std_msgs::msg::Bool>("lift/fault", 10);
     following_error_pub_ = this->create_publisher<std_msgs::msg::Bool>("lift/following_error", 10);
     limit_stop_pub_ = this->create_publisher<std_msgs::msg::Bool>("lift/limit_stop", 10);
-    digital_inputs_pub_ = this->create_publisher<std_msgs::msg::Int32>("lift/drive_digital_inputs", 10);
+    drive_limit_status_pub_ = this->create_publisher<std_msgs::msg::Int32>("lift/drive_limit_status", 10);
+    limit_1_triggered_pub_ = this->create_publisher<std_msgs::msg::Bool>("lift/limit_1_triggered", 10);
+    limit_2_triggered_pub_ = this->create_publisher<std_msgs::msg::Bool>("lift/limit_2_triggered", 10);
 
     // 版本信息使用 latched QoS — 后订阅的节点也能立即收到
     rclcpp::QoS latched_qos(rclcpp::KeepLast(1));
@@ -160,8 +162,8 @@ void LiftController::loadConfig() {
     this->declare_parameter("pdo_enabled", true);
     this->declare_parameter("pdo_frequency_hz", 200);
     this->declare_parameter("limit_safety_enabled", true);
-    this->declare_parameter("limit_1_direction", "min");
-    this->declare_parameter("limit_2_direction", "max");
+    this->declare_parameter("limit_1_direction", "max");
+    this->declare_parameter("limit_2_direction", "min");
     this->declare_parameter("limit_1_input_mask", 1);
     this->declare_parameter("limit_2_input_mask", 2);
     this->declare_parameter("limit_inputs_active_high", true);
@@ -262,9 +264,27 @@ void LiftController::publishState() {
     follow_err_msg.data = current_status_.following_error;
     following_error_pub_->publish(follow_err_msg);
 
-    auto digital_inputs_msg = std_msgs::msg::Int32();
-    digital_inputs_msg.data = static_cast<int32_t>(current_status_.digital_inputs);
-    digital_inputs_pub_->publish(digital_inputs_msg);
+    auto drive_limit_status_msg = std_msgs::msg::Int32();
+    drive_limit_status_msg.data = static_cast<int32_t>(current_status_.limit_status);
+    drive_limit_status_pub_->publish(drive_limit_status_msg);
+
+    const auto inputActive = [this](uint32_t mask) {
+        const bool matched = (current_status_.limit_status & mask) != 0;
+        return limit_inputs_active_high_ ? matched : !matched;
+    };
+    const bool limit_1_active =
+        current_status_.limit_status_valid && limit_1_block_direction_ != 0 &&
+        limit_1_input_mask_ != 0 && inputActive(limit_1_input_mask_);
+    const bool limit_2_active =
+        current_status_.limit_status_valid && limit_2_block_direction_ != 0 &&
+        limit_2_input_mask_ != 0 && inputActive(limit_2_input_mask_);
+    auto limit_1_msg = std_msgs::msg::Bool();
+    limit_1_msg.data = limit_1_active;
+    limit_1_triggered_pub_->publish(limit_1_msg);
+
+    auto limit_2_msg = std_msgs::msg::Bool();
+    limit_2_msg.data = limit_2_active;
+    limit_2_triggered_pub_->publish(limit_2_msg);
 }
 
 void LiftController::updateDriveLimitState(const MotorStatus& status) {
@@ -277,7 +297,7 @@ void LiftController::updateDriveLimitState(const MotorStatus& status) {
     const bool limit_1_invalid = limit_1_enabled && !limit_1_configured;
     const bool limit_2_invalid = limit_2_enabled && !limit_2_configured;
 
-    if (!status.digital_inputs_valid) {
+    if (!status.limit_status_valid) {
         bool active = limit_1_invalid || limit_2_invalid;
         std::string reason;
         if (limit_1_invalid && limit_2_invalid) {
@@ -306,15 +326,15 @@ void LiftController::updateDriveLimitState(const MotorStatus& status) {
     }
 
     const auto inputActive = [this, &status](uint32_t mask) {
-        const bool matched = (status.digital_inputs & mask) != 0;
+        const bool matched = (status.limit_status & mask) != 0;
         return limit_inputs_active_high_ ? matched : !matched;
     };
 
     const bool limit_1_triggered =
-        status.digital_inputs_valid && limit_1_enabled && limit_1_configured &&
+        status.limit_status_valid && limit_1_enabled && limit_1_configured &&
         inputActive(limit_1_input_mask_);
     const bool limit_2_triggered =
-        status.digital_inputs_valid && limit_2_enabled && limit_2_configured &&
+        status.limit_status_valid && limit_2_enabled && limit_2_configured &&
         inputActive(limit_2_input_mask_);
 
     bool active = limit_1_triggered || limit_2_triggered;
@@ -456,7 +476,7 @@ void LiftController::checkLimitStatusTimeout() {
             std::lock_guard<std::mutex> lock(limit_mutex_);
             limit_safety_fault_active_ = true;
         }
-        setLimitStopState(true, "drive digital input status timeout");
+        setLimitStopState(true, "drive limit status timeout");
     }
 }
 

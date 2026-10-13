@@ -18,12 +18,12 @@ struct MotorStatus {
     uint16_t error_code;
     int32_t position_pulses;
     int32_t speed_01rpm;
-    uint32_t digital_inputs;
+    uint16_t limit_status;
     bool is_enabled;
     bool target_reached;
     bool is_fault;
     bool following_error;  // bit13: 位置跟随误差超限
-    bool digital_inputs_valid;
+    bool limit_status_valid;
 };
 
 struct MotorConfig {
